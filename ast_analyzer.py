@@ -986,7 +986,9 @@ class ASTAnalyzer:
     def _analyze_repeated_calls_in_scope(self):
         """Find repeated expensive calls within function scope."""
         # expensive calls to track
-        expensive_calls = {'db.actor', 'time_global', 'alife', 'system_ini', 'level.object_by_id',
+        # NOTE: time_global() is NOT included because it returns different values
+        # each call (current time) - caching it breaks elapsed time calculations
+        expensive_calls = {'db.actor', 'alife', 'system_ini', 'level.object_by_id',
                            'device', 'get_console', 'get_hud'}
 
         # group by function scope
@@ -1015,8 +1017,6 @@ class ASTAnalyzer:
 
                     if name == 'db.actor':
                         suggestion = 'local actor = db.actor'
-                    elif name == 'time_global':
-                        suggestion = 'local tg = time_global()'
                     elif name == 'alife':
                         suggestion = 'local sim = alife()'
                     elif name == 'system_ini':

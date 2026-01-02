@@ -50,7 +50,7 @@ python stalker_lua_lint.py [path_to_mods] [options]
 - `math.pow(x, 2)` → `x*x`
 - `math.pow(x, 0.5)` → `math.sqrt(x)`
 - Uncached globals used 3+ times
-- Repeated `db.actor`, `time_global()`, `alife()` calls
+- Repeated `db.actor`, `alife()`, `device()`, `get_console()` calls
 
 ### YELLOW (review needed)
 - String concatenation in loops (`s = s .. x`) - fixable with `--experimental`
