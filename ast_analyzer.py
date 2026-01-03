@@ -245,6 +245,9 @@ class ASTAnalyzer:
             s = node.s
             if isinstance(s, bytes):
                 s = s.decode('utf-8', errors='replace')
+            # use single quotes if string contains double quotes
+            if '"' in s and "'" not in s:
+                return f"'{s}'"
             return f'"{s}"'
         elif isinstance(node, (TrueExpr,)):
             return "true"
@@ -276,10 +279,72 @@ class ASTAnalyzer:
             return f"{source}:{func}({args})"
         elif isinstance(node, ULengthOP):
             return f"#{self._node_to_string(node.operand)}"
+        elif isinstance(node, UMinusOp):
+            return f"-{self._node_to_string(node.operand)}"
+        elif isinstance(node, ULNotOp):
+            return f"not {self._node_to_string(node.operand)}"
+        elif isinstance(node, UBNotOp):
+            return f"~{self._node_to_string(node.operand)}"
         elif isinstance(node, Concat):
             left = self._node_to_string(node.left)
             right = self._node_to_string(node.right)
             return f"{left} .. {right}"
+        elif isinstance(node, OrLoOp):
+            left = self._node_to_string(node.left)
+            right = self._node_to_string(node.right)
+            return f"({left} or {right})"
+        elif isinstance(node, AndLoOp):
+            left = self._node_to_string(node.left)
+            right = self._node_to_string(node.right)
+            return f"({left} and {right})"
+        elif isinstance(node, AddOp):
+            left = self._node_to_string(node.left)
+            right = self._node_to_string(node.right)
+            return f"{left} + {right}"
+        elif isinstance(node, SubOp):
+            left = self._node_to_string(node.left)
+            right = self._node_to_string(node.right)
+            return f"{left} - {right}"
+        elif isinstance(node, MultOp):
+            left = self._node_to_string(node.left)
+            right = self._node_to_string(node.right)
+            return f"{left} * {right}"
+        elif isinstance(node, FloatDivOp):
+            left = self._node_to_string(node.left)
+            right = self._node_to_string(node.right)
+            return f"{left} / {right}"
+        elif isinstance(node, ModOp):
+            left = self._node_to_string(node.left)
+            right = self._node_to_string(node.right)
+            return f"{left} % {right}"
+        elif isinstance(node, ExpoOp):
+            left = self._node_to_string(node.left)
+            right = self._node_to_string(node.right)
+            return f"{left} ^ {right}"
+        elif isinstance(node, EqToOp):
+            left = self._node_to_string(node.left)
+            right = self._node_to_string(node.right)
+            return f"{left} == {right}"
+        elif isinstance(node, NotEqToOp):
+            left = self._node_to_string(node.left)
+            right = self._node_to_string(node.right)
+            return f"{left} ~= {right}"
+        elif isinstance(node, LessThanOp):
+            left = self._node_to_string(node.left)
+            right = self._node_to_string(node.right)
+            return f"{left} < {right}"
+        elif isinstance(node, GreaterThanOp):
+            left = self._node_to_string(node.left)
+            right = self._node_to_string(node.right)
+            return f"{left} > {right}"
+        elif isinstance(node, LessOrEqThanOp):
+            left = self._node_to_string(node.left)
+            right = self._node_to_string(node.right)
+            return f"{left} <= {right}"
+        elif isinstance(node, GreaterOrEqThanOp):
+            left = self._node_to_string(node.left)
+            right = self._node_to_string(node.right)
+            return f"{left} >= {right}"
         elif isinstance(node, Table):
             return "{...}"
         else:
