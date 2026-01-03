@@ -13,6 +13,7 @@ python stalker_lua_lint.py [path_to_mods] [options]
 --fix-yellow - Fix unsafe (YELLOW) issues automatically
 --fix-debug - Comment out debug statements (log, printf, print, etc.)
 --experimental - Enable experimental fixes (string concat in loops)
+--direct - Process scripts directly (searches for .script files recursively in the path or you can provide single .script path)
 
 # Reports & Restore
 --report [file] - Generate comprehensive report (.txt, .html, .json)
@@ -29,6 +30,8 @@ python stalker_lua_lint.py [path_to_mods] [options]
 # Backup Management
 --backup / --no-backup - Create .bak files before modifying (default: True)
 --list-backups - List all .bak backup files
+
+# Danger Zone (do not use this)
 --clean-backups - Remove all .bak backup files
 ```
 
