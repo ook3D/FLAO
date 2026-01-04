@@ -185,7 +185,9 @@ def main():
 
     # tyr get path interactively if not provided
     if args.path:
-        mods_path = Path(args.path)
+        # strip quotes and trailing slashes to avoid path issues
+        clean_path = args.path.strip('"\'').rstrip('/\\')
+        mods_path = Path(clean_path)
     else:
         print("Anomaly Lua Auto Optimizer (ALAO)")
         print("=" * 55)
@@ -193,7 +195,8 @@ def main():
         if not user_input:
             print("No path provided. Exiting.")
             sys.exit(1)
-        mods_path = Path(user_input)
+        clean_path = user_input.strip('"\'').rstrip('/\\')
+        mods_path = Path(clean_path)
 
     if not mods_path.exists():
         print(f"Error: Path does not exist: {mods_path}")
