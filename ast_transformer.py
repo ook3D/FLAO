@@ -599,10 +599,23 @@ class ASTTransformer:
         if loop_start == loop_end:
             return  # one-liner loop, too complex to transform safely
         
-        # skip if any concat is on same line as loop start (embedded in for header)
+        # skip if any concat is on same line as loop start or loop end (embedded/one-liner)
         for concat_line in concat_lines:
-            if concat_line == loop_start:
-                return  # concat embedded in loop header, skip
+            if concat_line == loop_start or concat_line == loop_end:
+                return  # concat embedded in loop header/footer, skip
+        
+        # Bug #32 fix: Additional check - verify concat lines don't contain loop keywords
+        # This catches one-liners that the AST might report with different start/end lines
+        for concat_line in concat_lines:
+            line_start, line_end = self._get_line_span(concat_line)
+            if line_start is not None:
+                line_text = self.source[line_start:line_end]
+                # if the concat line contains 'for ' and ' end', it's a one-liner loop
+                if re.search(r'\bfor\b.*\bend\b', line_text):
+                    return  # one-liner loop detected via text analysis
+                # if line contains 'for ' at all, it's embedded in loop header
+                if re.search(r'\bfor\s+', line_text):
+                    return  # embedded in for header
         
         parts_var = f'_{var}_parts'
         
@@ -897,6 +910,15 @@ class ASTTransformer:
 
             indent = self._get_indent_at_line(first_call.line)
             
+            # Bug #33 fix: check if insertion point is inside a multi-line comment
+            # scan from start of file to insertion point for --[[ and ]]
+            text_before = self.source[:insert_pos]
+            mlc_open = text_before.rfind('--[[')
+            mlc_close = text_before.rfind(']]')
+            if mlc_open != -1 and (mlc_close == -1 or mlc_close < mlc_open):
+                # we're inside a multi-line comment, skip this optimization
+                return
+            
             # is this a method cache (obj:method()) vs global cache (func())
             is_method_cache = ':' in call_pattern
 
@@ -990,9 +1012,19 @@ class ASTTransformer:
                         return
                     
                     # insert right after function declaration
-                    insert_pos = self._get_line_start(scope.start_line + 1)
-                    if insert_pos is None:
+                    new_insert_pos = self._get_line_start(scope.start_line + 1)
+                    if new_insert_pos is None:
                         return
+                    
+                    # Bug #33 fix: check if new insertion point is inside a multi-line comment
+                    text_before_new = self.source[:new_insert_pos]
+                    mlc_open_new = text_before_new.rfind('--[[')
+                    mlc_close_new = text_before_new.rfind(']]')
+                    if mlc_open_new != -1 and (mlc_close_new == -1 or mlc_close_new < mlc_open_new):
+                        # new position is inside a multi-line comment, skip this optimization
+                        return
+                    
+                    insert_pos = new_insert_pos
                     # use indent from first call (which is inside the function body)
                     # but reduced by one level since first_call may be inside if/for
                     call_indent = self._get_indent_at_line(first_call.line)
@@ -1291,12 +1323,21 @@ class ASTTransformer:
         # sort by priority descending, then position descending
         self.edits.sort(key=lambda e: (-e.priority, -e.start_char))
 
-        # remove overlapping edits (keep higher priority / earlier in sort)
+        # remove overlapping and duplicate edits (keep higher priority / earlier in sort)
         filtered = []
         covered_ranges: List[Tuple[int, int]] = []
+        seen_insertions: set = set()  # track (position, replacement) for pure insertions
 
         for edit in self.edits:
             overlaps = False
+            
+            # check for duplicate insertions at same position
+            if edit.start_char == edit.end_char:
+                insertion_key = (edit.start_char, edit.replacement)
+                if insertion_key in seen_insertions:
+                    continue  # skip duplicate insertion
+                seen_insertions.add(insertion_key)
+            
             for start, end in covered_ranges:
                 # check for overlap
                 if edit.start_char < end and edit.end_char > start:
