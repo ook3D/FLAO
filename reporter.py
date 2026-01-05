@@ -144,6 +144,15 @@ class Reporter:
         """Add a finding to the report."""
         self.findings[mod_name][str(file_path)].append(finding)
 
+    @property
+    def all_findings(self) -> List[Finding]:
+        """Get flat list of all findings."""
+        result = []
+        for mod in self.findings.values():
+            for file_findings in mod.values():
+                result.extend(file_findings)
+        return result
+
     def count_by_severity(self, severity: str) -> int:
         """Count total findings of a specific severity."""
         count = 0

@@ -1704,21 +1704,12 @@ class ASTAnalyzer:
     def _walk_for_false_conditions(self, node_type, dead_type: str):
         """Walk AST to find if/while with literal false conditions."""
         
-        visited = set()  # track visited node ids to avoid duplicates
-        
         def is_literal_false(node: Node) -> bool:
             """Check if node is literal false or nil."""
             return isinstance(node, (FalseExpr, Nil))
         
-        def check_node(node: Node, scope_name: str):
-            if node is None:
-                return
-            
-            node_id = id(node)
-            if node_id in visited:
-                return
-            visited.add(node_id)
-            
+        # single flat walk - O(n) instead of O(n²)
+        for node in ast.walk(self._ast_tree):
             if isinstance(node, node_type):
                 if hasattr(node, 'test') and is_literal_false(node.test):
                     start_line = self._get_line(node)
@@ -1739,7 +1730,7 @@ class ASTAnalyzer:
                         dead_type=dead_type,
                         start_line=start_line,
                         end_line=end_line,
-                        scope_name=scope_name,
+                        scope_name='<unknown>',
                         description=f'{type_name} false block (never executes)',
                         is_safe_to_remove=True,
                         code_preview=code_preview,
@@ -1755,19 +1746,11 @@ class ASTAnalyzer:
                             'dead_type': dead_type,
                             'start_line': start_line,
                             'end_line': end_line,
-                            'scope_name': scope_name,
+                            'scope_name': '<unknown>',
                             'is_safe_to_remove': True,
                         },
                         source_line=self._get_source_line(start_line),
                     ))
-            
-            # recurse into children
-            for child in ast.walk(node):
-                if child is not node:
-                    check_node(child, scope_name)
-        
-        if self._ast_tree:
-            check_node(self._ast_tree, '<global>')
 
     def _detect_unused_local_vars(self):
         """Detect local variables that are assigned but never read (Phase 2 - warning only)."""
@@ -1775,11 +1758,8 @@ class ASTAnalyzer:
         local_vars: Dict[str, LocalVarInfo] = {}
         assignment_targets: Set[int] = set()  # ids of Name nodes that are assignment targets
         
-        # First pass: collect all local variable assignments and mark their target nodes
-        def collect_assignments(node: Node):
-            if node is None:
-                return
-            
+        # First pass: collect all local variable assignments - O(n)
+        for node in ast.walk(self._ast_tree):
             if isinstance(node, LocalAssign):
                 line = self._get_line(node)
                 for target in node.targets:
@@ -1840,16 +1820,9 @@ class ASTAnalyzer:
                                     is_function=False,
                                     is_loop_var=True,
                                 )
-            
-            for child in ast.walk(node):
-                if child is not node:
-                    collect_assignments(child)
         
-        # Second pass: find all reads (Name nodes that are NOT assignment targets)
-        def find_reads(node: Node):
-            if node is None:
-                return
-            
+        # Second pass: find all reads - O(n)
+        for node in ast.walk(self._ast_tree):
             if isinstance(node, Name):
                 # only count as read if NOT an assignment target
                 if id(node) not in assignment_targets:
@@ -1858,20 +1831,12 @@ class ASTAnalyzer:
                         local_vars[var_name].is_read = True
             
             # Check RegisterScriptCallback for callback registration
-            if isinstance(node, Call):
+            elif isinstance(node, Call):
                 func_name = self._node_to_string(node.func)
                 if func_name == 'RegisterScriptCallback' and len(node.args) >= 2:
                     callback_func = self._node_to_string(node.args[1])
                     if callback_func:
                         self.callback_registrations.add(callback_func)
-            
-            for child in ast.walk(node):
-                if child is not node:
-                    find_reads(child)
-        
-        if self._ast_tree:
-            collect_assignments(self._ast_tree)
-            find_reads(self._ast_tree)
         
         # report unused locals
         for name, info in local_vars.items():
@@ -1899,10 +1864,8 @@ class ASTAnalyzer:
         local_funcs: Dict[str, LocalVarInfo] = {}
         called_funcs: Set[str] = set()
         
-        def walk_node(node: Node):
-            if node is None:
-                return
-            
+        # Single pass through AST - O(n)
+        for node in ast.walk(self._ast_tree):
             if isinstance(node, LocalFunction):
                 line = self._get_line(node)
                 if isinstance(node.name, Name):
@@ -1931,13 +1894,6 @@ class ASTAnalyzer:
             elif isinstance(node, Name):
                 # function reference (not call)
                 called_funcs.add(node.id)
-            
-            for child in ast.walk(node):
-                if child is not node:
-                    walk_node(child)
-        
-        if self._ast_tree:
-            walk_node(self._ast_tree)
         
         # report unused local functions
         for name, info in local_funcs.items():

@@ -2,16 +2,16 @@
 
 AST-based Lua analyzer and optimizer for Anomaly mods _(a Lua swiss-knife, in some way)_.  
 Made for **LuaJIT 2.0.4** _(Lua 5.1)_ in the first place (comes with the latest [Modded Exes](https://github.com/themrdemonized/xray-monolith)).  
-Highly experimental, but battle tested with huge modpacks (600+ mods).
+Highly experimental _(mostly proof-of-concept)_, but battle tested with huge modpacks (600+ mods).
 
 ## How it works?
 Lua is a programming language.  
-As all programming languages, it has a syntax based code.  
-Thus, it can be parsed into so-called AST (abstract syntax tree).
+And as all programming languages, it has a syntax based code.  
+Thus, it can be parsed into so-called AST _(abstract syntax tree)_.
 
 With AST we can manipulate the code however we want without the high risk of breaking things.  
 Lua VM itself parses code into AST, then compiles it to bytecode, then executes the bytecode _(obviously)_.  
-Just like we do it with ALAO.
+ALAO also converts the code to AST.
 
 After that, we search for potential poorly optimized code entities.  
 And switch them to a better alternatives _(direct opcodes, caching, 
@@ -19,12 +19,13 @@ reduced allocations, etc)_.
 
 One of the examples: https://onecompiler.com/lua/449f75hkd  
 The original function has a complexity of **O(n²)**.  
-The auto-fixed by ALAO function has a complexity of **O(n)**.  
+The auto-fixed _(by ALAO)_ function has a complexity of **O(n)**.  
 For huge data _(say, 100k iterations)_, it works approximately 150x faster.  
 It also prevents unnecessary memory allocations, further reducing GC pressure.
 
 Another simple example ALAO handles is the usage of `math.pow(v, 2)`.  
-We can replace the function call with a single MUL bytecode instruction `v*v`.  
+We can replace the function call with a single MUL bytecode instruction `v*v`.   
+The same pattern applies to  `math.pow(v, 3)` and `math.pow(v, 0.5)`.
 
 
 ## Quick Start
