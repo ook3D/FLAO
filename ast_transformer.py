@@ -33,14 +33,21 @@ class ASTTransformer:
 
     def transform_file(self, file_path: Path, backup: bool = True, dry_run: bool = False,
                        fix_debug: bool = False, fix_yellow: bool = False,
-                       experimental: bool = False) -> Tuple[bool, str, int]:
+                       experimental: bool = False, fix_nil: bool = False,
+                       remove_dead_code: bool = False) -> Tuple[bool, str, int]:
         """
         Transform a file based on findings.
         Returns (was_modified, new_content, edit_count).
+        
+        Args:
+            fix_nil: If True, auto-fix safe nil access patterns
+            remove_dead_code: If True, remove 100% safe dead code (after return, if false, etc.)
         """
         self.file_path = file_path
         self.edits = []
         self.experimental = experimental
+        self.fix_nil = fix_nil
+        self.remove_dead_code = remove_dead_code
 
         # run analyzer
         self.analyzer = ASTAnalyzer()
@@ -65,6 +72,27 @@ class ASTTransformer:
                                   if f.pattern_name == 'string_concat_in_loop' 
                                   and f.severity == 'YELLOW']
             fixable.extend(experimental_fixes)
+        
+        # add safe nil fixes if enabled
+        if fix_nil:
+            nil_fixes = [f for f in findings 
+                        if f.pattern_name == 'potential_nil_access'
+                        and f.details.get('is_safe_to_fix', False)]
+            # only add if not already in fixable
+            existing_lines = {f.line_num for f in fixable}
+            for nf in nil_fixes:
+                if nf.line_num not in existing_lines:
+                    fixable.append(nf)
+        
+        # add safe dead code removal if enabled
+        if remove_dead_code:
+            dead_code_fixes = [f for f in findings
+                              if f.pattern_name.startswith('dead_code_')
+                              and f.details.get('is_safe_to_remove', False)]
+            existing_lines = {f.line_num for f in fixable}
+            for df in dead_code_fixes:
+                if df.line_num not in existing_lines:
+                    fixable.append(df)
 
         if not fixable:
             return False, self.source, 0
@@ -113,6 +141,12 @@ class ASTTransformer:
         elif pattern == 'string_concat_in_loop':
             if getattr(self, 'experimental', False):
                 self._edit_string_concat_in_loop(finding)
+        elif pattern == 'potential_nil_access':
+            if getattr(self, 'fix_nil', False):
+                self._edit_nil_access(finding)
+        elif pattern.startswith('dead_code_'):
+            if getattr(self, 'remove_dead_code', False):
+                self._edit_dead_code(finding)
         elif pattern.startswith('repeated_'):
             self._edit_repeated_calls(finding)
 
@@ -376,6 +410,162 @@ class ASTTransformer:
             priority=200,
         ))
 
+    def _edit_nil_access(self, finding: Finding):
+        """
+        Wrap unsafe nil access with if-then guard.
+        
+        Before:
+            local obj = level.object_by_id(id)
+            local sec = obj:section()
+            
+        After:
+            local obj = level.object_by_id(id)
+            if obj then
+                local sec = obj:section()
+            end
+            
+        Only applies to safe-to-fix cases (immediately after assignment).
+        """
+        details = finding.details
+        
+        # only fix safe cases
+        if not details.get('is_safe_to_fix', False):
+            return
+        
+        var_name = details.get('var_name')
+        assign_line = details.get('assign_line')
+        access_line = finding.line_num
+        
+        if not var_name or not assign_line:
+            return
+        
+        # get the access line
+        access_line_start, access_line_end = self._get_line_span(access_line)
+        if access_line_start is None:
+            return
+        
+        access_line_text = self.source[access_line_start:access_line_end]
+        
+        # determine indent from the access line
+        indent = ''
+        for ch in access_line_text:
+            if ch in ' \t':
+                indent += ch
+            else:
+                break
+        
+        # look ahead to see how many consecutive lines use this variable
+        # we want to wrap all of them in the if block
+        lines_to_wrap = [access_line]
+        current_line = access_line + 1
+        source_lines = self.source.splitlines()
+        
+        while current_line <= len(source_lines):
+            next_start, next_end = self._get_line_span(current_line)
+            if next_start is None:
+                break
+            next_text = self.source[next_start:next_end].strip()
+            
+            # stop if empty line or line without the variable
+            if not next_text:
+                break
+            
+            # check if this line uses the variable with a method/index call
+            if f'{var_name}:' in next_text or f'{var_name}.' in next_text:
+                lines_to_wrap.append(current_line)
+                current_line += 1
+            else:
+                break
+        
+        # get the full range of lines to wrap
+        first_line_start, _ = self._get_line_span(lines_to_wrap[0])
+        _, last_line_end = self._get_line_span(lines_to_wrap[-1])
+        
+        if first_line_start is None or last_line_end is None:
+            return
+        
+        # extract all lines to wrap
+        wrapped_content = self.source[first_line_start:last_line_end]
+        
+        # remove trailing newline for proper handling
+        had_trailing_newline = wrapped_content.endswith('\n')
+        wrapped_content = wrapped_content.rstrip('\n')
+        
+        # indent each line and wrap with if-then-end
+        wrapped_lines = wrapped_content.split('\n')
+        indented_lines = []
+        for line in wrapped_lines:
+            stripped = line.lstrip()
+            if stripped:
+                indented_lines.append(f'{indent}    {stripped}')
+            else:
+                indented_lines.append('')
+        
+        new_content = f'{indent}if {var_name} then\n'
+        new_content += '\n'.join(indented_lines)
+        new_content += f'\n{indent}end'
+        if had_trailing_newline:
+            new_content += '\n'
+        
+        self.edits.append(SourceEdit(
+            start_char=first_line_start,
+            end_char=last_line_end,
+            replacement=new_content,
+            priority=50,  # lower priority - apply after other fixes
+        ))
+
+    def _edit_dead_code(self, finding: Finding):
+        """
+        Remove dead code that is 100% safe to remove.
+        
+        Handles:
+        - Code after unconditional return
+        - Code after break in loops
+        - if false then ... end blocks
+        - while false do ... end loops
+        """
+        details = finding.details
+        
+        # only remove if marked as safe
+        if not details.get('is_safe_to_remove', False):
+            return
+        
+        dead_type = details.get('dead_type', '')
+        start_line = details.get('start_line', 0)
+        end_line = details.get('end_line', 0)
+        
+        if not start_line or not end_line:
+            return
+        
+        # get the character positions for the lines to remove
+        start_pos, _ = self._get_line_span(start_line)
+        _, end_pos = self._get_line_span(end_line)
+        
+        if start_pos is None or end_pos is None:
+            return
+        
+        # determine what to replace with
+        if dead_type in ('after_return', 'after_break'):
+            # remove the dead statements entirely
+            # but preserve any trailing newline to keep formatting
+            replacement = ''
+        elif dead_type in ('if_false', 'while_false'):
+            # remove the entire if/while block
+            # check if there's only whitespace before on the same line
+            line_content = self.source[start_pos:end_pos]
+            
+            # preserve indentation context - just remove the block
+            replacement = ''
+        else:
+            return
+        
+        self.edits.append(SourceEdit(
+            start_char=start_pos,
+            end_char=end_pos,
+            replacement=replacement,
+            priority=10,  # high priority - remove dead code first
+        ))
+
     def _edit_string_concat_in_loop(self, finding: Finding):
         """
         Transform string concatenation in loops to table.concat pattern.
@@ -606,15 +796,25 @@ class ASTTransformer:
             cache_line = 'local hud = get_hud()'
             new_name = 'hud'
             call_pattern = 'get_hud()'
+        elif pattern == 'repeated_game_ini':
+            cache_line = 'local g_ini = game_ini()'
+            new_name = 'g_ini'
+            call_pattern = 'game_ini()'
+        elif pattern == 'repeated_getFS':
+            cache_line = 'local fs = getFS()'
+            new_name = 'fs'
+            call_pattern = 'getFS()'
         elif pattern == 'repeated_level_name':
             cache_line = 'local level_name = level.name()'
             new_name = 'level_name'
             call_pattern = 'level.name()'
-        elif pattern.endswith('_section()') or pattern.endswith('_id()') or pattern.endswith('_clsid()'):
+        elif pattern.endswith('_story_id()') or pattern.endswith('_section()') or pattern.endswith('_id()') or pattern.endswith('_clsid()'):
             # dynamic method caching: repeated_obj_section(), repeated_item_id(), etc
             # extract object name and method from pattern: repeated_obj_section() -> obj, section
             # pattern format: repeated_{objname}_{method}()
-            match = re.match(r'repeated_(.+)_(section|id|clsid)\(\)$', pattern)
+            # NOTE: story_id must be checked before id since _id() is suffix of _story_id()
+            # NOTE: Use non-greedy (.+?) to avoid capturing part of method name
+            match = re.match(r'repeated_(.+?)_(story_id|section|clsid|id)\(\)$', pattern)
             if not match:
                 return
             sanitized_obj_name = match.group(1)
@@ -631,12 +831,12 @@ class ASTTransformer:
                     real_obj_name = 'self.' + sanitized_obj_name[5:]
                 else:
                     real_obj_name = sanitized_obj_name
-
+            
             # SAFETY CHECK: skip if object is an indexed expression (e.g., t[a], arr[i])
-            # These can't be converted to valid variable names
+            # These can't be converted to valid Lua variable names
             if '[' in real_obj_name or ']' in real_obj_name:
                 return
-
+            
             # generate cache variable name (always use sanitized for variable)
             if method_name == 'section':
                 new_name = f'{sanitized_obj_name}_sec'
@@ -644,6 +844,8 @@ class ASTTransformer:
                 new_name = f'{sanitized_obj_name}_id'
             elif method_name == 'clsid':
                 new_name = f'{sanitized_obj_name}_cls'
+            elif method_name == 'story_id':
+                new_name = f'{sanitized_obj_name}_sid'
             else:
                 new_name = f'{sanitized_obj_name}_{method_name}'
             
