@@ -606,6 +606,32 @@ class ASTTransformer:
             cache_line = 'local hud = get_hud()'
             new_name = 'hud'
             call_pattern = 'get_hud()'
+        elif pattern == 'repeated_level_name':
+            cache_line = 'local level_name = level.name()'
+            new_name = 'level_name'
+            call_pattern = 'level.name()'
+        elif pattern.endswith('_section()') or pattern.endswith('_id()') or pattern.endswith('_clsid()'):
+            # dynamic method caching: repeated_obj_section(), repeated_item_id(), etc
+            # extract object name and method from pattern: repeated_obj_section() -> obj, section
+            # pattern format: repeated_{objname}_{method}()
+            match = re.match(r'repeated_(.+)_(section|id|clsid)\(\)$', pattern)
+            if not match:
+                return
+            obj_name = match.group(1)
+            method_name = match.group(2)
+            
+            # generate cache variable name
+            if method_name == 'section':
+                new_name = f'{obj_name}_sec'
+            elif method_name == 'id':
+                new_name = f'{obj_name}_id'
+            elif method_name == 'clsid':
+                new_name = f'{obj_name}_cls'
+            else:
+                new_name = f'{obj_name}_{method_name}'
+            
+            cache_line = f'local {new_name} = {obj_name}:{method_name}()'
+            call_pattern = f'{obj_name}:{method_name}()'
         else:
             return
 
@@ -700,7 +726,15 @@ class ASTTransformer:
 
                 # if calls span multiple lines and first call is inside a loop OR different branches,
                 # insert at function body start instead to avoid scope issues
+                # BUT: for method caching (obj:section(), obj:id(), obj:clsid()), we can't hoist
+                # to function start because the object may not be defined there yet
+                is_method_cache = ':' in call_pattern
+                
                 if (has_loop_before_first_call or has_branch_between_calls) and last_call.line > first_call.line:
+                    if is_method_cache:
+                        # for method caching, skip if branches exist - too risky to hoist
+                        return
+                    
                     # insert right after function declaration
                     insert_pos = self._get_line_start(scope.start_line + 1)
                     if insert_pos is None:

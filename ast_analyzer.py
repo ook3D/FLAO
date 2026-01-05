@@ -23,8 +23,6 @@ from typing import List, Dict, Set, Optional, Tuple, Any
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections import defaultdict
-import sys
-import io
 
 from models import Finding
 
@@ -178,7 +176,7 @@ class ASTAnalyzer:
         self.loop_depth: int = 0
         self.function_depth: int = 0
 
-    def analyze_file(self, file_path: Path, verbose: bool = False) -> List[Finding]:
+    def analyze_file(self, file_path: Path) -> List[Finding]:
         """Analyze a Lua file and return findings."""
         self.reset()
         self.file_path = file_path
@@ -191,16 +189,9 @@ class ASTAnalyzer:
         self.source_lines = self.source.splitlines()
 
         try:
-            # suppress ANTLR lexer error output during parse
-            old_stderr = sys.stderr
-            sys.stderr = io.StringIO()
-            try:
-                tree = ast.parse(self.source)
-            finally:
-                sys.stderr = old_stderr
+            tree = ast.parse(self.source)
         except Exception:
-            if verbose:
-                print(f"  [WARN] Failed to parse: {file_path}", file=sys.stderr)
+            # parse error, skip
             return []
 
         # create global scope
@@ -672,6 +663,10 @@ class ASTAnalyzer:
                 if len(node.values) == 1:
                     self._record_assignment(target_name, node.values[0], line, is_local=False)
 
+        # visit targets (for calls inside index expressions like db.storage[npc:id()])
+        for target in node.targets:
+            self._visit(target)
+
         # visit values
         for value in node.values:
             self._visit(value)
@@ -1065,7 +1060,14 @@ class ASTAnalyzer:
         # NOTE: level.object_by_id() is NOT auto-fixed because different IDs give
         # different objects, and even same IDs can change if object is destroyed
         expensive_calls = {'db.actor', 'alife', 'system_ini',
-                           'device', 'get_console', 'get_hud'}
+                           'device', 'get_console', 'get_hud', 'level.name'}
+
+        # method calls that are safe to cache (immutable object properties)
+        # based on X-Ray engine source analysis:
+        # - :section() returns stored NameSection member (xr_object.h:155)
+        # - :id() returns stored Props.net_ID member (xr_object.h:98)
+        # - :clsid() returns stored m_script_clsid member (GameObject.h:257)
+        cacheable_methods = {'section', 'id', 'clsid'}
 
         # group by function scope
         scope_calls: Dict[Scope, Dict[str, List[CallInfo]]] = defaultdict(lambda: defaultdict(list))
@@ -1076,8 +1078,8 @@ class ASTAnalyzer:
                 if func_scope:
                     scope_calls[func_scope][call.full_name].append(call)
 
-            # special: track :section() calls on objects
-            if call.func == 'section' and ':' in call.full_name:
+            # track cacheable method calls on objects (:section(), :id(), :clsid())
+            if call.func in cacheable_methods and ':' in call.full_name:
                 func_scope = self._find_function_scope(call.scope)
                 if func_scope:
                     key = f"{call.full_name}()"
@@ -1103,6 +1105,8 @@ class ASTAnalyzer:
                         suggestion = 'local console = get_console()'
                     elif name == 'get_hud':
                         suggestion = 'local hud = get_hud()'
+                    elif name == 'level.name':
+                        suggestion = 'local level_name = level.name()'
                     else:
                         suggestion = f'Cache {name} result'
 
