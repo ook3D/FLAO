@@ -33,14 +33,21 @@ class ASTTransformer:
 
     def transform_file(self, file_path: Path, backup: bool = True, dry_run: bool = False,
                        fix_debug: bool = False, fix_yellow: bool = False,
-                       experimental: bool = False) -> Tuple[bool, str, int]:
+                       experimental: bool = False, fix_nil: bool = False,
+                       remove_dead_code: bool = False) -> Tuple[bool, str, int]:
         """
         Transform a file based on findings.
         Returns (was_modified, new_content, edit_count).
+        
+        Args:
+            fix_nil: If True, auto-fix safe nil access patterns
+            remove_dead_code: If True, remove 100% safe dead code (after return, if false, etc.)
         """
         self.file_path = file_path
         self.edits = []
         self.experimental = experimental
+        self.fix_nil = fix_nil
+        self.remove_dead_code = remove_dead_code
 
         # run analyzer
         self.analyzer = ASTAnalyzer()
@@ -65,6 +72,27 @@ class ASTTransformer:
                                   if f.pattern_name == 'string_concat_in_loop' 
                                   and f.severity == 'YELLOW']
             fixable.extend(experimental_fixes)
+        
+        # add safe nil fixes if enabled
+        if fix_nil:
+            nil_fixes = [f for f in findings 
+                        if f.pattern_name == 'potential_nil_access'
+                        and f.details.get('is_safe_to_fix', False)]
+            # only add if not already in fixable
+            existing_lines = {f.line_num for f in fixable}
+            for nf in nil_fixes:
+                if nf.line_num not in existing_lines:
+                    fixable.append(nf)
+        
+        # add safe dead code removal if enabled
+        if remove_dead_code:
+            dead_code_fixes = [f for f in findings
+                              if f.pattern_name.startswith('dead_code_')
+                              and f.details.get('is_safe_to_remove', False)]
+            existing_lines = {f.line_num for f in fixable}
+            for df in dead_code_fixes:
+                if df.line_num not in existing_lines:
+                    fixable.append(df)
 
         if not fixable:
             return False, self.source, 0
@@ -86,11 +114,12 @@ class ASTTransformer:
 
         if not dry_run:
             if backup:
-                backup_path = file_path.with_suffix(file_path.suffix + '.bak')
+                # use .alao-bak extension to distinguish from mod author backups
+                backup_path = file_path.with_suffix(file_path.suffix + '.alao-bak')
                 if not backup_path.exists():
                     shutil.copy2(file_path, backup_path)
 
-            file_path.write_text(new_content, encoding='utf-8')
+            file_path.write_text(new_content, encoding='latin-1')
 
         return True, new_content, edit_count
 
@@ -113,6 +142,12 @@ class ASTTransformer:
         elif pattern == 'string_concat_in_loop':
             if getattr(self, 'experimental', False):
                 self._edit_string_concat_in_loop(finding)
+        elif pattern == 'potential_nil_access':
+            if getattr(self, 'fix_nil', False):
+                self._edit_nil_access(finding)
+        elif pattern.startswith('dead_code_'):
+            if getattr(self, 'remove_dead_code', False):
+                self._edit_dead_code(finding)
         elif pattern.startswith('repeated_'):
             self._edit_repeated_calls(finding)
 
@@ -376,6 +411,150 @@ class ASTTransformer:
             priority=200,
         ))
 
+    def _edit_nil_access(self, finding: Finding):
+        """
+        Wrap unsafe nil access with if-then guard.
+        
+        Before:
+            local obj = level.object_by_id(id)
+            obj:set_visual("stalker")
+            
+        After:
+            local obj = level.object_by_id(id)
+            if obj then
+                obj:set_visual("stalker")
+            end
+            
+        Only applies to safe-to-fix cases (immediately after assignment).
+        Only wraps SINGLE lines to avoid corrupting nested control structures.
+        
+        IMPORTANT: Does NOT wrap lines containing 'local' declarations,
+        as that would change variable scope and break code that uses
+        the variable outside the if block.
+        """
+        details = finding.details
+        
+        # only fix safe cases
+        if not details.get('is_safe_to_fix', False):
+            return
+        
+        var_name = details.get('var_name')
+        assign_line = details.get('assign_line')
+        access_line = finding.line_num
+        
+        if not var_name or not assign_line:
+            return
+        
+        # get the access line
+        access_line_start, access_line_end = self._get_line_span(access_line)
+        if access_line_start is None:
+            return
+        
+        access_line_text = self.source[access_line_start:access_line_end]
+        stripped_access = access_line_text.strip()
+        
+        # SAFETY CHECK: don't wrap lines with local declarations
+        if stripped_access.startswith('local '):
+            return
+        
+        # SAFETY CHECK: don't wrap control flow statements (if, for, while, etc.)
+        # these have complex nested structures that can get corrupted
+        control_keywords = ('if ', 'if(', 'for ', 'while ', 'repeat', 'function ', 'function(')
+        if any(stripped_access.startswith(kw) for kw in control_keywords):
+            return
+        
+        # SAFETY CHECK: don't wrap incomplete statements (multi-line function calls, etc.)
+        # check for unbalanced parentheses - if line has more '(' than ')', it continues on next line
+        open_parens = stripped_access.count('(')
+        close_parens = stripped_access.count(')')
+        if open_parens > close_parens:
+            return
+        
+        # SAFETY CHECK: don't wrap lines ending with opening constructs
+        rstripped = stripped_access.rstrip()
+        if rstripped.endswith('(') or rstripped.endswith(',') or rstripped.endswith('..'):
+            return
+        
+        # determine indent from the access line
+        indent = ''
+        for ch in access_line_text:
+            if ch in ' \t':
+                indent += ch
+            else:
+                break
+        
+        # ONLY wrap this single line - don't try to wrap multiple lines
+        # Multi-line wrapping is error-prone with nested structures
+        wrapped_content = stripped_access
+        
+        # build the replacement
+        new_content = f'{indent}if {var_name} then\n'
+        new_content += f'{indent}    {wrapped_content}\n'
+        new_content += f'{indent}end'
+        
+        # preserve trailing newline if original had one
+        if access_line_text.endswith('\n'):
+            new_content += '\n'
+        
+        self.edits.append(SourceEdit(
+            start_char=access_line_start,
+            end_char=access_line_end,
+            replacement=new_content,
+            priority=50,
+        ))
+
+    def _edit_dead_code(self, finding: Finding):
+        """
+        Remove dead code that is 100% safe to remove.
+        
+        Handles:
+        - Code after unconditional return
+        - Code after break in loops
+        - if false then ... end blocks
+        - while false do ... end loops
+        """
+        details = finding.details
+        
+        # only remove if marked as safe
+        if not details.get('is_safe_to_remove', False):
+            return
+        
+        dead_type = details.get('dead_type', '')
+        start_line = details.get('start_line', 0)
+        end_line = details.get('end_line', 0)
+        
+        if not start_line or not end_line:
+            return
+        
+        # get the character positions for the lines to remove
+        start_pos, _ = self._get_line_span(start_line)
+        _, end_pos = self._get_line_span(end_line)
+        
+        if start_pos is None or end_pos is None:
+            return
+        
+        # determine what to replace with
+        if dead_type in ('after_return', 'after_break'):
+            # remove the dead statements entirely
+            # but preserve any trailing newline to keep formatting
+            replacement = ''
+        elif dead_type in ('if_false', 'while_false'):
+            # remove the entire if/while block
+            # check if there's only whitespace before on the same line
+            line_content = self.source[start_pos:end_pos]
+            
+            # preserve indentation context - just remove the block
+            replacement = ''
+        else:
+            return
+        
+        self.edits.append(SourceEdit(
+            start_char=start_pos,
+            end_char=end_pos,
+            replacement=replacement,
+            priority=10,  # high priority - remove dead code first
+        ))
+
     def _edit_string_concat_in_loop(self, finding: Finding):
         """
         Transform string concatenation in loops to table.concat pattern.
@@ -606,6 +785,61 @@ class ASTTransformer:
             cache_line = 'local hud = get_hud()'
             new_name = 'hud'
             call_pattern = 'get_hud()'
+        elif pattern == 'repeated_game_ini':
+            cache_line = 'local g_ini = game_ini()'
+            new_name = 'g_ini'
+            call_pattern = 'game_ini()'
+        elif pattern == 'repeated_getFS':
+            cache_line = 'local fs = getFS()'
+            new_name = 'fs'
+            call_pattern = 'getFS()'
+        elif pattern == 'repeated_level_name':
+            cache_line = 'local level_name = level.name()'
+            new_name = 'level_name'
+            call_pattern = 'level.name()'
+        elif pattern.endswith('_story_id()') or pattern.endswith('_section()') or pattern.endswith('_id()') or pattern.endswith('_clsid()'):
+            # dynamic method caching: repeated_obj_section(), repeated_item_id(), etc
+            # extract object name and method from pattern: repeated_obj_section() -> obj, section
+            # pattern format: repeated_{objname}_{method}()
+            # NOTE: story_id must be checked before id since _id() is suffix of _story_id()
+            # NOTE: Use non-greedy (.+?) to avoid capturing part of method name
+            match = re.match(r'repeated_(.+?)_(story_id|section|clsid|id)\(\)$', pattern)
+            if not match:
+                return
+            sanitized_obj_name = match.group(1)
+            method_name = match.group(2)
+            
+            # get original object name from details if available (e.g. "self.object:id()")
+            original_call = details.get('original_call', '') if details else ''
+            if original_call and ':' in original_call:
+                # extract original object name: "self.object:id()" -> "self.object"
+                real_obj_name = original_call.split(':')[0]
+            else:
+                # fallback: try to restore dots from underscores for common patterns
+                if sanitized_obj_name.startswith('self_'):
+                    real_obj_name = 'self.' + sanitized_obj_name[5:]
+                else:
+                    real_obj_name = sanitized_obj_name
+            
+            # SAFETY CHECK: skip if object is an indexed expression (e.g., t[a], arr[i])
+            # These can't be converted to valid Lua variable names
+            if '[' in real_obj_name or ']' in real_obj_name:
+                return
+            
+            # generate cache variable name (always use sanitized for variable)
+            if method_name == 'section':
+                new_name = f'{sanitized_obj_name}_sec'
+            elif method_name == 'id':
+                new_name = f'{sanitized_obj_name}_id'
+            elif method_name == 'clsid':
+                new_name = f'{sanitized_obj_name}_cls'
+            elif method_name == 'story_id':
+                new_name = f'{sanitized_obj_name}_sid'
+            else:
+                new_name = f'{sanitized_obj_name}_{method_name}'
+            
+            cache_line = f'local {new_name} = {real_obj_name}:{method_name}()'
+            call_pattern = f'{real_obj_name}:{method_name}()'
         else:
             return
 
@@ -632,6 +866,9 @@ class ASTTransformer:
                 return
 
             indent = self._get_indent_at_line(first_call.line)
+            
+            # is this a method cache (obj:method()) vs global cache (func())
+            is_method_cache = ':' in call_pattern
 
             # check if first call is inside a table constructor or function call arguments
             # look for unbalanced { or ( in lines before this one within scope
@@ -677,6 +914,25 @@ class ASTTransformer:
                 if paren_depth > 0:
                     return  # inside function call arguments, skip optimization
 
+                # SAFETY CHECK: detect nil-guarded method calls
+                # Pattern: "obj and obj:method()" or "if obj and ... obj:method()"
+                # These rely on short-circuit evaluation for safety - caching breaks this
+                if is_method_cache:
+                    first_ls, first_le = self._get_line_span(first_call.line)
+                    if first_ls is not None:
+                        first_line_text = self.source[first_ls:first_le]
+                        # extract object name from call_pattern: "obj:method()" -> "obj"
+                        obj_name = call_pattern.split(':')[0]
+                        
+                        # check if this line has pattern: "obj and" before "obj:method"
+                        call_pos = first_line_text.find(call_pattern)
+                        if call_pos > 0:
+                            before_call = first_line_text[:call_pos]
+                            nil_guard_pattern = rf'\b{re.escape(obj_name)}\s+and\b'
+                            if re.search(nil_guard_pattern, before_call):
+                                # object is nil-guarded, skip caching to preserve safety
+                                return
+
                 # check if calls span different blocks
                 # look for else/elseif/end between first and last call
                 last_call = calls[-1]
@@ -698,9 +954,11 @@ class ASTTransformer:
                                     has_branch_between_calls = True
                                     break
 
-                # if calls span multiple lines and first call is inside a loop OR different branches,
-                # insert at function body start instead to avoid scope issues
                 if (has_loop_before_first_call or has_branch_between_calls) and last_call.line > first_call.line:
+                    if is_method_cache:
+                        # for method caching, skip if branches exist - too risky to hoist
+                        return
+                    
                     # insert right after function declaration
                     insert_pos = self._get_line_start(scope.start_line + 1)
                     if insert_pos is None:
@@ -1030,7 +1288,8 @@ class ASTTransformer:
 
 def transform_file(file_path: Path, backup: bool = True, dry_run: bool = False,
                    fix_debug: bool = False, fix_yellow: bool = False,
-                   experimental: bool = False) -> Tuple[bool, str, int]:
+                   experimental: bool = False, fix_nil: bool = False,
+                   remove_dead_code: bool = False) -> Tuple[bool, str, int]:
     """Convenience function to transform a file. Returns (modified, content, edit_count)."""
     transformer = ASTTransformer()
-    return transformer.transform_file(file_path, backup, dry_run, fix_debug, fix_yellow, experimental)
+    return transformer.transform_file(file_path, backup, dry_run, fix_debug, fix_yellow, experimental, fix_nil, remove_dead_code)

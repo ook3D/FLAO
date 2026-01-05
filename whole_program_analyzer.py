@@ -1,0 +1,427 @@
+"""
+As the name of this file suggests, this is a whole-program analyzer meant for cross-file dead code detection.
+"""
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, Set, List, Tuple, Optional, Any
+from collections import defaultdict
+import sys
+import io
+
+from luaparser import ast
+from luaparser.astnodes import (
+    Node, Chunk, Block,
+    Function, LocalFunction, Method,
+    Assign, LocalAssign,
+    Call, Invoke,
+    Index, Name, String,
+    Return, Break,
+)
+
+
+@dataclass
+class SymbolDefinition:
+    """Tracks where a symbol is defined."""
+    name: str
+    file_path: Path
+    line: int
+    symbol_type: str  # 'global_function', 'module_function', 'local_function', 'global_var', 'local_var'
+    scope: str  # 'global', 'module', 'local'
+    is_callback: bool = False
+    is_class_method: bool = False
+
+
+@dataclass
+class SymbolUsage:
+    """Tracks where a symbol is used."""
+    name: str
+    file_path: Path
+    line: int
+    usage_type: str  # 'call', 'read', 'callback_register'
+
+
+@dataclass
+class CrossFileAnalysis:
+    """Results of whole-program analysis."""
+    definitions: Dict[str, List[SymbolDefinition]] = field(default_factory=lambda: defaultdict(list))
+    usages: Dict[str, List[SymbolUsage]] = field(default_factory=lambda: defaultdict(list))
+    registered_callbacks: Set[str] = field(default_factory=set)
+    exported_symbols: Set[str] = field(default_factory=set)  # symbols that might be used externally
+    
+    def is_symbol_used(self, name: str) -> bool:
+        """Check if a symbol is used anywhere."""
+        return name in self.usages or name in self.registered_callbacks or name in self.exported_symbols
+    
+    def get_unused_globals(self) -> List[SymbolDefinition]:
+        """Get global symbols that appear unused."""
+        unused = []
+        for name, defs in self.definitions.items():
+            for d in defs:
+                if d.scope == 'global' and not self.is_symbol_used(name):
+                    unused.append(d)
+        return unused
+
+
+# Known callback names that the engine or scripts can call
+KNOWN_CALLBACKS = frozenset({
+    # Engine callbacks (registered via RegisterScriptCallback)
+    'actor_on_update', 'actor_on_first_update', 'actor_on_before_death',
+    'actor_on_item_take', 'actor_on_item_drop', 'actor_on_item_use',
+    'actor_on_weapon_fired', 'actor_on_weapon_jammed', 'actor_on_weapon_reload',
+    'actor_on_hud_animation_end', 'actor_on_hud_animation_play',
+    'actor_on_feel_touch', 'actor_on_footstep',
+    'actor_on_trade', 'actor_on_info_callback',
+    'npc_on_update', 'npc_on_death_callback', 'npc_on_before_hit', 'npc_on_hit_callback',
+    'npc_on_net_spawn', 'npc_on_net_destroy',
+    'monster_on_update', 'monster_on_death_callback', 'monster_on_before_hit', 'monster_on_hit_callback',
+    'monster_on_net_spawn', 'monster_on_net_destroy',
+    'on_key_press', 'on_key_release', 'on_key_hold',
+    'on_before_hit', 'on_hit',
+    'physic_object_on_hit_callback',
+    'save_state', 'load_state',
+    'on_game_start', 'on_game_load',
+    'server_entity_on_register', 'server_entity_on_unregister',
+    'squad_on_npc_creation', 'squad_on_first_update', 'squad_on_update',
+    'smart_terrain_on_update',
+    'on_before_level_changing', 'on_level_changing',
+    
+    # Class methods that engine calls
+    'net_spawn', 'net_destroy', 'reinit', 'reload', 
+    'update', 'save', 'load', 'finalize',
+    'death_callback', 'hit_callback', 'use_callback',
+    'activate_scheme', 'deactivate_scheme', 'reset_scheme',
+    'evaluate', 'execute',
+    
+    # UI callbacks
+    'InitControls', 'InitCallBacks', 'OnMsgYes', 'OnMsgNo', 'OnMsgOk', 'OnMsgCancel',
+    'OnKeyboard', 'OnButton_clicked', 'OnListItemClicked', 'OnListItemDbClicked',
+    
+    # MCM (Mod Configuration Menu) callbacks
+    'on_mcm_load', 'on_option_change',
+})
+
+# Patterns that indicate a function is exported/public
+EXPORT_PATTERNS = {
+    '_G',           # _G.func = ...
+    'rawset',       # rawset(_G, "name", func)
+    'module',       # module pattern
+}
+
+
+class WholeProgramAnalyzer:
+    """Performs whole-program analysis across multiple script files."""
+    
+    def __init__(self):
+        self.analysis = CrossFileAnalysis()
+        self.files_analyzed: Set[Path] = set()
+        self.parse_errors: List[Tuple[Path, str]] = []
+    
+    def analyze_directory(self, directory: Path, recursive: bool = True) -> CrossFileAnalysis:
+        """Analyze all .script files in a directory."""
+        pattern = '**/*.script' if recursive else '*.script'
+        script_files = list(directory.glob(pattern))
+        
+        # Pass 1: Collect all definitions
+        for script_path in script_files:
+            self._collect_definitions(script_path)
+        
+        # Pass 2: Collect all usages
+        for script_path in script_files:
+            self._collect_usages(script_path)
+        
+        return self.analysis
+    
+    def analyze_files(self, files: List[Path]) -> CrossFileAnalysis:
+        """Analyze a specific list of files."""
+        # Pass 1: Collect all definitions
+        for script_path in files:
+            self._collect_definitions(script_path)
+        
+        # Pass 2: Collect all usages
+        for script_path in files:
+            self._collect_usages(script_path)
+        
+        return self.analysis
+    
+    def _parse_file(self, file_path: Path) -> Optional[Chunk]:
+        """Parse a Lua file, returning None on error."""
+        try:
+            source = file_path.read_text(encoding='utf-8', errors='ignore')
+            old_stderr = sys.stderr
+            sys.stderr = io.StringIO()
+            try:
+                tree = ast.parse(source)
+            finally:
+                sys.stderr = old_stderr
+            return tree
+        except Exception as e:
+            self.parse_errors.append((file_path, str(e)))
+            return None
+    
+    def _collect_definitions(self, file_path: Path):
+        """Pass 1: Collect all symbol definitions from a file."""
+        tree = self._parse_file(file_path)
+        if not tree:
+            return
+        
+        self.files_analyzed.add(file_path)
+        self._visit_for_definitions(tree, file_path)
+    
+    def _collect_usages(self, file_path: Path):
+        """Pass 2: Collect all symbol usages from a file."""
+        tree = self._parse_file(file_path)
+        if not tree:
+            return
+        
+        source = file_path.read_text(encoding='utf-8', errors='ignore')
+        self._visit_for_usages(tree, file_path, source)
+    
+    def _get_line(self, node: Node) -> int:
+        """Extract line number from node."""
+        ft = getattr(node, 'first_token', None)
+        if ft:
+            s = str(ft)
+            if ',' in s:
+                parts = s.rsplit(',', 1)
+                if len(parts) == 2:
+                    line_col = parts[1].rstrip(']')
+                    if ':' in line_col:
+                        try:
+                            return int(line_col.split(':')[0])
+                        except ValueError:
+                            pass
+        return 0
+    
+    def _node_to_string(self, node: Node) -> str:
+        """Convert AST node to string representation."""
+        if isinstance(node, Name):
+            return node.id
+        elif isinstance(node, Index):
+            value = self._node_to_string(node.value)
+            idx = self._node_to_string(node.idx)
+            idx_token = getattr(node.idx, 'first_token', None)
+            if idx_token is not None and str(idx_token) != 'None':
+                return f"{value}[{idx}]"
+            else:
+                return f"{value}.{idx}"
+        elif isinstance(node, String):
+            s = node.s
+            if isinstance(s, bytes):
+                s = s.decode('utf-8', errors='replace')
+            return s
+        return ""
+    
+    def _visit_for_definitions(self, node: Node, file_path: Path, in_local_scope: bool = False):
+        """Visit AST to collect definitions."""
+        if node is None:
+            return
+        
+        # Global function: function name() ... end
+        if isinstance(node, Function):
+            if isinstance(node.name, Name):
+                name = node.name.id
+                line = self._get_line(node)
+                is_callback = name in KNOWN_CALLBACKS
+                
+                self.analysis.definitions[name].append(SymbolDefinition(
+                    name=name,
+                    file_path=file_path,
+                    line=line,
+                    symbol_type='global_function',
+                    scope='global',
+                    is_callback=is_callback,
+                ))
+                
+                if is_callback:
+                    self.analysis.registered_callbacks.add(name)
+            
+            # Module function: function module.name() ... end
+            elif isinstance(node.name, Index):
+                full_name = self._node_to_string(node.name)
+                line = self._get_line(node)
+                
+                self.analysis.definitions[full_name].append(SymbolDefinition(
+                    name=full_name,
+                    file_path=file_path,
+                    line=line,
+                    symbol_type='module_function',
+                    scope='module',
+                ))
+                # module functions are potentially exported
+                self.analysis.exported_symbols.add(full_name)
+        
+        # Local function: local function name() ... end
+        elif isinstance(node, LocalFunction):
+            if isinstance(node.name, Name):
+                name = node.name.id
+                line = self._get_line(node)
+                is_callback = name in KNOWN_CALLBACKS
+                
+                self.analysis.definitions[f"local:{file_path.stem}:{name}"].append(SymbolDefinition(
+                    name=name,
+                    file_path=file_path,
+                    line=line,
+                    symbol_type='local_function',
+                    scope='local',
+                    is_callback=is_callback,
+                ))
+        
+        # Method definition: function class:method() ... end
+        elif isinstance(node, Method):
+            source = self._node_to_string(node.source)
+            method = node.name.id if isinstance(node.name, Name) else ""
+            full_name = f"{source}:{method}"
+            line = self._get_line(node)
+            is_class_method = method in KNOWN_CALLBACKS
+            
+            self.analysis.definitions[full_name].append(SymbolDefinition(
+                name=full_name,
+                file_path=file_path,
+                line=line,
+                symbol_type='method',
+                scope='module',
+                is_class_method=is_class_method,
+            ))
+            
+            if is_class_method:
+                self.analysis.exported_symbols.add(full_name)
+        
+        # Global assignment: name = value
+        elif isinstance(node, Assign):
+            for target in node.targets:
+                if isinstance(target, Name):
+                    name = target.id
+                    line = self._get_line(node)
+                    
+                    # Check if assigning a function
+                    if node.values and len(node.values) == 1:
+                        val = node.values[0]
+                        if isinstance(val, Function):
+                            is_callback = name in KNOWN_CALLBACKS
+                            self.analysis.definitions[name].append(SymbolDefinition(
+                                name=name,
+                                file_path=file_path,
+                                line=line,
+                                symbol_type='global_function',
+                                scope='global',
+                                is_callback=is_callback,
+                            ))
+                            if is_callback:
+                                self.analysis.registered_callbacks.add(name)
+                        else:
+                            self.analysis.definitions[name].append(SymbolDefinition(
+                                name=name,
+                                file_path=file_path,
+                                line=line,
+                                symbol_type='global_var',
+                                scope='global',
+                            ))
+                
+                # Module assignment: module.name = value
+                elif isinstance(target, Index):
+                    full_name = self._node_to_string(target)
+                    line = self._get_line(node)
+                    
+                    self.analysis.definitions[full_name].append(SymbolDefinition(
+                        name=full_name,
+                        file_path=file_path,
+                        line=line,
+                        symbol_type='module_var',
+                        scope='module',
+                    ))
+                    self.analysis.exported_symbols.add(full_name)
+        
+        # Recurse into children
+        for child in ast.walk(node):
+            if child is not node:
+                self._visit_for_definitions(child, file_path, in_local_scope)
+    
+    def _visit_for_usages(self, node: Node, file_path: Path, source: str):
+        """Visit AST to collect usages."""
+        if node is None:
+            return
+        
+        # Function call: name() or module.name()
+        if isinstance(node, Call):
+            func_name = self._node_to_string(node.func)
+            line = self._get_line(node)
+            
+            if func_name:
+                self.analysis.usages[func_name].append(SymbolUsage(
+                    name=func_name,
+                    file_path=file_path,
+                    line=line,
+                    usage_type='call',
+                ))
+            
+            # Check for RegisterScriptCallback("name", func)
+            if func_name == 'RegisterScriptCallback' and len(node.args) >= 2:
+                callback_name = self._node_to_string(node.args[0])
+                callback_func = self._node_to_string(node.args[1])
+                
+                if callback_name:
+                    self.analysis.registered_callbacks.add(callback_name)
+                if callback_func:
+                    self.analysis.registered_callbacks.add(callback_func)
+                    self.analysis.usages[callback_func].append(SymbolUsage(
+                        name=callback_func,
+                        file_path=file_path,
+                        line=line,
+                        usage_type='callback_register',
+                    ))
+        
+        # Method call: obj:method()
+        elif isinstance(node, Invoke):
+            source_name = self._node_to_string(node.source)
+            method_name = node.func.id if isinstance(node.func, Name) else ""
+            full_name = f"{source_name}:{method_name}"
+            line = self._get_line(node)
+            
+            # Track usage of the object
+            if source_name:
+                self.analysis.usages[source_name].append(SymbolUsage(
+                    name=source_name,
+                    file_path=file_path,
+                    line=line,
+                    usage_type='read',
+                ))
+        
+        # Variable read: name
+        elif isinstance(node, Name):
+            name = node.id
+            line = self._get_line(node)
+            
+            self.analysis.usages[name].append(SymbolUsage(
+                name=name,
+                file_path=file_path,
+                line=line,
+                usage_type='read',
+            ))
+        
+        # Index read: module.name or module["name"]
+        elif isinstance(node, Index):
+            full_name = self._node_to_string(node)
+            line = self._get_line(node)
+            
+            if full_name:
+                self.analysis.usages[full_name].append(SymbolUsage(
+                    name=full_name,
+                    file_path=file_path,
+                    line=line,
+                    usage_type='read',
+                ))
+
+
+def analyze_mods_directory(mods_path: Path) -> CrossFileAnalysis:
+    """Convenience function to analyze entire mods directory."""
+    analyzer = WholeProgramAnalyzer()
+    
+    # Find all gamedata/scripts directories
+    script_dirs = list(mods_path.glob('*/gamedata/scripts'))
+    
+    all_scripts = []
+    for script_dir in script_dirs:
+        all_scripts.extend(script_dir.glob('*.script'))
+    
+    return analyzer.analyze_files(all_scripts)

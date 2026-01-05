@@ -86,6 +86,77 @@ DIRECT_REPLACEMENT_FUNCS = frozenset({
     'table.insert', 'table.getn', 'string.len',
 })
 
+# Functions/properties that can return nil - calling methods on these without
+# nil checks can cause CTD (crash to desktop)
+# Format: full_name -> description of when it returns nil
+NIL_RETURNING_FUNCTIONS = {
+    # level functions
+    'level.object_by_id': 'object is offline or does not exist',
+    'level.get_target_obj': 'nothing under crosshair',
+    'level.get_target_element': 'nothing under crosshair',
+    
+    # alife functions
+    'alife': 'called from main menu or during loading',
+    'alife().object': 'object does not exist in simulation',
+    'alife():object': 'object does not exist in simulation',
+    
+    # game object methods that can return nil
+    ':parent': 'object has no parent (not in inventory)',
+    ':best_enemy': 'no enemy detected',
+    ':best_item': 'no item of interest found',
+    ':best_danger': 'no danger detected',
+    ':active_item': 'no weapon/item currently equipped',
+    ':active_detector': 'no detector currently active',
+    ':object': 'item not in inventory or index out of bounds',
+    ':get_enemy': 'no current enemy target',
+    ':get_corpse': 'no corpse being investigated',
+    ':get_current_outfit': 'no outfit equipped',
+    ':item_in_slot': 'slot is empty',
+    ':get_helicopter': 'not a helicopter or no helicopter',
+    ':get_car': 'not in a vehicle',
+    ':get_campfire': 'not a campfire zone',
+    ':get_artefact': 'not an artefact',
+    ':get_physics_shell': 'object has no physics shell',
+    ':spawn_ini': 'no spawn ini defined',
+    ':motivation_action_manager': 'not an NPC with action manager',
+    
+    # common patterns
+    'db.actor': 'called from main menu or during loading',
+    'db.storage': 'storage not initialized',  # db.storage[id] can be nil
+}
+
+# Method patterns that indicate the variable is being nil-checked
+# These patterns mean the variable is safe to use after the check
+NIL_CHECK_PATTERNS = {
+    'if {var} then',
+    'if {var} and',
+    'if not {var} then return',
+    'if not {var} then return end',
+    'if {var} == nil then return',
+    'if {var} == nil then return end', 
+    'if {var} ~= nil then',
+    '{var} and {var}:',
+    '{var} and {var}.',
+}
+
+# Callback parameters that are guaranteed non-nil by the engine
+# Format: (callback_name, param_index) - 0-indexed
+SAFE_CALLBACK_PARAMS = {
+    'actor_on_item_take': {0},      # item
+    'actor_on_item_drop': {0},      # item
+    'actor_on_item_use': {0},       # item
+    'actor_on_trade': {0, 1},       # item, sell_buy  
+    'npc_on_death_callback': {0, 1}, # npc, killer
+    'monster_on_death_callback': {0, 1}, # monster, killer
+    'npc_on_hit_callback': {0},     # npc
+    'monster_on_hit_callback': {0}, # monster
+    'on_before_hit': {0, 1, 2},     # obj, shit, bone_id
+    'physic_object_on_hit_callback': {0}, # obj
+    'actor_on_before_death': {0, 1}, # who, flags
+    'save_state': {0},              # m_data
+    'load_state': {0},              # m_data
+}
+
 
 @dataclass
 class Scope:
@@ -153,6 +224,55 @@ class ConcatInfo:
     right_expr: Optional[str] = None    # string repr of right side of concat
 
 
+@dataclass
+class NilSourceInfo:
+    """Information about a variable assigned from a nil-returning function."""
+    var_name: str           # variable name
+    source_call: str        # the call that might return nil (e.g. "level.object_by_id(id)")
+    source_func: str        # just the function name (e.g. "level.object_by_id")
+    assign_line: int        # line where assignment happened
+    scope: Scope            # scope of the variable
+    is_local: bool          # whether it's a local variable
+    is_guarded: bool = False  # whether a nil check was found after assignment
+
+
+@dataclass 
+class NilAccessInfo:
+    """Information about accessing a potentially nil variable."""
+    var_name: str           # the variable being accessed
+    access_type: str        # 'method' or 'index'
+    access_call: str        # full call (e.g. "obj:section()")
+    access_line: int
+    nil_source: NilSourceInfo  # the nil source info
+    is_safe_to_fix: bool = False  # whether this can be auto-fixed
+
+
+@dataclass
+class DeadCodeInfo:
+    """Information about dead/unreachable code."""
+    dead_type: str          # 'after_return', 'after_break', 'if_false', 'while_false', 'unused_local_var', 'unused_local_func'
+    start_line: int
+    end_line: int
+    scope_name: str
+    description: str
+    is_safe_to_remove: bool = False  # True only for 100% safe cases
+    code_preview: str = ""
+    node: Optional[Node] = None
+
+
+@dataclass
+class LocalVarInfo:
+    """Information about a local variable for dead code analysis."""
+    name: str
+    assign_line: int
+    scope: Scope
+    is_read: bool = False       # has the variable been read?
+    is_function: bool = False   # is it a local function?
+    read_lines: List[int] = field(default_factory=list)
+    is_loop_var: bool = False   # is it a for loop variable?
+    is_param: bool = False      # is it a function parameter?
+
+
 class ASTAnalyzer:
     """AST-based Lua code analyzer."""
 
@@ -170,6 +290,17 @@ class ASTAnalyzer:
         self.assigns: List[AssignInfo] = []
         self.concats: List[ConcatInfo] = []
         self.global_writes: List[Tuple[str, int]] = []
+        
+        # nil access tracking
+        self.nil_sources: Dict[Tuple[int, str], NilSourceInfo] = {}  # (scope_id, var_name) -> nil source info
+        self.nil_accesses: List[NilAccessInfo] = []      # potential nil accesses
+        self.nil_guards: Set[Tuple[str, int]] = set()    # (var_name, line) pairs where nil check exists
+        
+        # dead code tracking
+        self.dead_code: List[DeadCodeInfo] = []
+        self.local_vars: Dict[Tuple[int, str], LocalVarInfo] = {}  # (scope_id, name) -> info
+        self.local_funcs: Dict[Tuple[int, str], LocalVarInfo] = {}  # (scope_id, name) -> info
+        self.callback_registrations: Set[str] = set()  # names registered as callbacks
 
         self.source_lines: List[str] = []
         self.source: str = ""
@@ -178,13 +309,17 @@ class ASTAnalyzer:
         self.loop_depth: int = 0
         self.function_depth: int = 0
 
-    def analyze_file(self, file_path: Path, verbose: bool = False) -> List[Finding]:
+    def analyze_file(self, file_path: Path) -> List[Finding]:
         """Analyze a Lua file and return findings."""
         self.reset()
         self.file_path = file_path
+        self._ast_tree = None
 
         try:
-            self.source = file_path.read_text(encoding='utf-8', errors='ignore')
+            # use latin-1 encoding which maps bytes 0-255 directly to unicode 0-255
+            # this preserves non-UTF-8 characters (like Windows-1252 bullet points)
+            # and allows the Lua parser to work correctly
+            self.source = file_path.read_text(encoding='latin-1')
         except Exception:
             return []
 
@@ -199,9 +334,11 @@ class ASTAnalyzer:
             finally:
                 sys.stderr = old_stderr
         except Exception:
-            if verbose:
-                print(f"  [WARN] Failed to parse: {file_path}", file=sys.stderr)
+            # parse error, skip
             return []
+
+        # store AST tree for dead code analysis
+        self._ast_tree = tree
 
         # create global scope
         self.global_scope = Scope(
@@ -672,6 +809,10 @@ class ASTAnalyzer:
                 if len(node.values) == 1:
                     self._record_assignment(target_name, node.values[0], line, is_local=False)
 
+        # visit targets (for calls inside index expressions like db.storage[npc:id()])
+        for target in node.targets:
+            self._visit(target)
+
         # visit values
         for value in node.values:
             self._visit(value)
@@ -743,6 +884,164 @@ class ASTAnalyzer:
             is_local=is_local,
             in_loop=self.loop_depth > 0,
         ))
+        
+        # Track nil-returning function assignments
+        self._track_nil_source(target, value, value_repr, line, is_local)
+
+    def _track_nil_source(self, target: str, value: Node, value_repr: str, line: int, is_local: bool):
+        """Track if a variable is assigned from a nil-returning function."""
+        source_func = None
+        
+        # Check if it's a call to a nil-returning function
+        if isinstance(value, Call):
+            # get the function name
+            _, _, full_name = self._get_call_name(value)
+            if full_name and full_name in NIL_RETURNING_FUNCTIONS:
+                source_func = full_name
+        
+        # Check for method call (Invoke) - e.g., obj:parent()
+        elif isinstance(value, Invoke):
+            method_name = value.func.id if isinstance(value.func, Name) else ''
+            method_pattern = f':{method_name}'
+            if method_pattern in NIL_RETURNING_FUNCTIONS:
+                source_func = method_pattern
+        
+        # Check for index access - e.g., db.actor, alife():object(id)
+        elif isinstance(value, Index):
+            full_name = self._node_to_string(value)
+            # check direct matches like db.actor
+            if full_name in NIL_RETURNING_FUNCTIONS:
+                source_func = full_name
+        
+        if source_func:
+            key = (id(self.current_scope), target)
+            self.nil_sources[key] = NilSourceInfo(
+                var_name=target,
+                source_call=value_repr,
+                source_func=source_func,
+                assign_line=line,
+                scope=self.current_scope,
+                is_local=is_local,
+                is_guarded=False,
+            )
+        else:
+            # if variable is reassigned from non-nil source, remove from tracking
+            key = (id(self.current_scope), target)
+            if key in self.nil_sources:
+                del self.nil_sources[key]
+
+    def _check_nil_access(self, source_node: Node, source_str: str, full_call: str, line: int, access_type: str):
+        """Check if we're accessing a potentially nil variable."""
+        # only check simple variable names for now
+        if not isinstance(source_node, Name):
+            return
+        
+        var_name = source_node.id
+        
+        # check if this variable is from a nil-returning function in an enclosing scope
+        nil_source = self._find_nil_source(var_name)
+        if not nil_source:
+            return
+        
+        # check if there's a nil guard before this access
+        if self._has_nil_guard(var_name, nil_source.assign_line, line):
+            nil_source.is_guarded = True
+            return
+        
+        # determine if this is safe to auto-fix
+        # Safe if: assignment is on previous line, this is the only usage before any branch
+        is_safe = self._is_safe_nil_fix(nil_source, line)
+        
+        self.nil_accesses.append(NilAccessInfo(
+            var_name=var_name,
+            access_type=access_type,
+            access_call=full_call,
+            access_line=line,
+            nil_source=nil_source,
+            is_safe_to_fix=is_safe,
+        ))
+
+    def _find_nil_source(self, var_name: str) -> Optional[NilSourceInfo]:
+        """Find nil source for a variable in current or enclosing scopes."""
+        # key is (scope_id, var_name)
+        scope = self.current_scope
+        while scope:
+            key = (id(scope), var_name)
+            if key in self.nil_sources:
+                return self.nil_sources[key]
+            scope = scope.parent
+        return None
+
+    def _has_nil_guard(self, var_name: str, assign_line: int, access_line: int) -> bool:
+        """Check if there's a nil guard between assignment and access."""
+        if assign_line >= access_line:
+            return False
+        
+        # check lines between assignment and access for nil guard patterns
+        for line_num in range(assign_line, access_line):
+            if line_num <= 0 or line_num > len(self.source_lines):
+                continue
+            line_text = self.source_lines[line_num - 1]
+            
+            # check for common nil guard patterns
+            # if var then / if var and / if not var then return
+            patterns = [
+                f'if {var_name} then',
+                f'if {var_name} and',
+                f'if not {var_name} then',
+                f'if {var_name} ~= nil',
+                f'if {var_name} == nil then return',
+                f'{var_name} and {var_name}:',
+                f'{var_name} and {var_name}.',
+            ]
+            for pattern in patterns:
+                if pattern in line_text:
+                    return True
+        
+        return False
+
+    def _is_safe_nil_fix(self, nil_source: NilSourceInfo, access_line: int) -> bool:
+        """
+        Determine if a nil access is safe to auto-fix.
+        
+        Safe conditions:
+        1. Access is on the line immediately after assignment
+        2. It's a local variable (not global)
+        3. Assignment and access are in the same scope
+        4. No complex control flow between them
+        5. Access line is NOT a local declaration (would break scope if wrapped)
+        6. Access line is NOT a control flow statement (if/for/while - too complex)
+        """
+        # must be immediately after (next line)
+        if access_line != nil_source.assign_line + 1:
+            return False
+        
+        # must be local
+        if not nil_source.is_local:
+            return False
+        
+        # must be in same scope
+        if self.current_scope != nil_source.scope:
+            return False
+        
+        # check that the line between is not a control flow statement
+        if nil_source.assign_line <= 0 or nil_source.assign_line > len(self.source_lines):
+            return False
+        
+        # check access line content
+        if access_line > 0 and access_line <= len(self.source_lines):
+            access_text = self.source_lines[access_line - 1].strip()
+            
+            # CRITICAL: access line must NOT be a local declaration
+            if access_text.startswith('local '):
+                return False
+            
+            # CRITICAL: access line must NOT be control flow (too complex to wrap)
+            control_keywords = ('if ', 'if(', 'for ', 'while ', 'repeat', 'function ', 'function(')
+            if any(access_text.startswith(kw) for kw in control_keywords):
+                return False
+            
+        return True
 
     def _visit_Call(self, node: Call):
         """Handle function call."""
@@ -787,6 +1086,9 @@ class ASTAnalyzer:
             in_loop=self.loop_depth > 0,
             loop_depth=self.loop_depth,
         ))
+        
+        # Check for potential nil access
+        self._check_nil_access(node.source, source, full_name, line, 'method')
 
         self._visit(node.source)
         for arg in node.args:
@@ -878,6 +1180,8 @@ class ASTAnalyzer:
         self._analyze_string_concat_in_loop()
         self._analyze_debug_statements()
         self._analyze_global_writes()
+        self._analyze_nil_access()
+        self._analyze_dead_code()
 
     def _analyze_table_insert(self):
         """Find table.insert(t, v) that can be t[#t+1] = v."""
@@ -1064,8 +1368,16 @@ class ASTAnalyzer:
         # each call (current time) - caching it breaks elapsed time calculations
         # NOTE: level.object_by_id() is NOT auto-fixed because different IDs give
         # different objects, and even same IDs can change if object is destroyed
-        expensive_calls = {'db.actor', 'alife', 'system_ini',
-                           'device', 'get_console', 'get_hud'}
+        expensive_calls = {'db.actor', 'alife', 'system_ini', 'game_ini', 'getFS',
+                           'device', 'get_console', 'get_hud', 'level.name'}
+
+        # method calls that are safe to cache (immutable object properties)
+        # based on X-Ray engine source analysis:
+        # - :section() returns stored NameSection member (xr_object.h:155)
+        # - :id() returns stored Props.net_ID member (xr_object.h:98)
+        # - :clsid() returns stored m_script_clsid member (GameObject.h:257)
+        # - :story_id() returns m_story_id set once from config (xrServer_Objects_ALife.cpp:375)
+        cacheable_methods = {'section', 'id', 'clsid', 'story_id'}
 
         # group by function scope
         scope_calls: Dict[Scope, Dict[str, List[CallInfo]]] = defaultdict(lambda: defaultdict(list))
@@ -1076,8 +1388,8 @@ class ASTAnalyzer:
                 if func_scope:
                     scope_calls[func_scope][call.full_name].append(call)
 
-            # special: track :section() calls on objects
-            if call.func == 'section' and ':' in call.full_name:
+            # track cacheable method calls on objects (:section(), :id(), :clsid())
+            if call.func in cacheable_methods and ':' in call.full_name:
                 func_scope = self._find_function_scope(call.scope)
                 if func_scope:
                     key = f"{call.full_name}()"
@@ -1103,6 +1415,8 @@ class ASTAnalyzer:
                         suggestion = 'local console = get_console()'
                     elif name == 'get_hud':
                         suggestion = 'local hud = get_hud()'
+                    elif name == 'level.name':
+                        suggestion = 'local level_name = level.name()'
                     else:
                         suggestion = f'Cache {name} result'
 
@@ -1119,6 +1433,7 @@ class ASTAnalyzer:
                             'lines': [c.line for c in calls],
                             'calls': calls,  # list of CallInfo with nodes
                             'scope': func_scope,
+                            'original_call': name,  # preserve original like "self.object:id()"
                         },
                         source_line=suggestion,
                     ))
@@ -1144,7 +1459,9 @@ class ASTAnalyzer:
                 init_line = None
                 is_safe = False
                 
-                if loop_scope:
+                # SAFETY: don't auto-fix nested loops (loop_depth > 1) because we can't
+                # reliably determine which loop's end to place table.concat after
+                if loop_scope and concat_info.loop_depth == 1:
                     # look for var = "" or var = '' IMMEDIATELY before the loop
                     # must be: within 3 lines, NOT inside any loop, and must be local declaration
                     for assign in self.assigns:
@@ -1216,6 +1533,407 @@ class ASTAnalyzer:
                 },
                 source_line=self._get_source_line(line),
             ))
+
+    def _analyze_nil_access(self):
+        """Generate findings for potential nil access patterns."""
+        for access in self.nil_accesses:
+            nil_source = access.nil_source
+            reason = NIL_RETURNING_FUNCTIONS.get(nil_source.source_func, 'may return nil')
+            
+            # determine severity based on whether it's safe to fix
+            if access.is_safe_to_fix:
+                severity = 'YELLOW'  # can be auto-fixed with --fix-nil
+                message = (f"Potential nil access: '{access.var_name}' from {nil_source.source_func}() "
+                          f"used without nil check (auto-fixable)")
+            else:
+                severity = 'YELLOW'  # warning only, needs manual review
+                message = (f"Potential nil access: '{access.var_name}' from {nil_source.source_func}() "
+                          f"used without nil check")
+            
+            self.findings.append(Finding(
+                pattern_name='potential_nil_access',
+                severity=severity,
+                line_num=access.access_line,
+                message=message,
+                details={
+                    'var_name': access.var_name,
+                    'source_func': nil_source.source_func,
+                    'source_call': nil_source.source_call,
+                    'assign_line': nil_source.assign_line,
+                    'access_call': access.access_call,
+                    'access_type': access.access_type,
+                    'is_safe_to_fix': access.is_safe_to_fix,
+                    'is_local': nil_source.is_local,
+                    'reason': reason,
+                },
+                source_line=self._get_source_line(access.access_line),
+            ))
+
+    def _analyze_dead_code(self):
+        """Analyze for dead/unreachable code patterns."""
+        if not hasattr(self, '_ast_tree') or self._ast_tree is None:
+            return
+        
+        # Phase 1: 100% safe patterns (auto-fixable)
+        self._detect_code_after_return()
+        self._detect_code_after_break()
+        self._detect_if_false_blocks()
+        self._detect_while_false_loops()
+        
+        # Phase 2: Warning patterns (not auto-fixable)
+        self._detect_unused_local_vars()
+        self._detect_unused_local_funcs()
+
+    def _detect_code_after_return(self):
+        """Detect unreachable code after unconditional return statements."""
+        self._walk_for_dead_after_terminator(Return, 'return')
+
+    def _detect_code_after_break(self):
+        """Detect unreachable code after break statements in loops."""
+        self._walk_for_dead_after_terminator(Break, 'break')
+
+    def _walk_for_dead_after_terminator(self, terminator_type, terminator_name: str):
+        """Walk AST to find dead code after terminators (return/break)."""
+        
+        def check_block(block_body: List[Node], scope_name: str, in_loop: bool = False):
+            """Check a block for dead code after terminators."""
+            if not block_body:
+                return
+            
+            for i, stmt in enumerate(block_body):
+                # check if this is a terminator
+                is_terminator = isinstance(stmt, terminator_type)
+                
+                # for break, only count as terminator if we're in a loop
+                if isinstance(stmt, Break) and not in_loop:
+                    continue
+                
+                if is_terminator and i < len(block_body) - 1:
+                    # there are statements after the terminator
+                    dead_start = i + 1
+                    dead_stmts = block_body[dead_start:]
+                    
+                    # filter out comments and semicolons
+                    real_dead = [s for s in dead_stmts 
+                                if not isinstance(s, (Comment, SemiColon))]
+                    
+                    if real_dead:
+                        first_dead = real_dead[0]
+                        last_dead = real_dead[-1]
+                        start_line = self._get_line(first_dead)
+                        end_line = self._get_end_line(last_dead) or start_line
+                        
+                        # get code preview
+                        preview_lines = []
+                        for ln in range(start_line, min(start_line + 3, end_line + 1)):
+                            if 0 < ln <= len(self.source_lines):
+                                preview_lines.append(self.source_lines[ln - 1].rstrip())
+                        code_preview = '\n'.join(preview_lines)
+                        if end_line > start_line + 2:
+                            code_preview += '\n...'
+                        
+                        self.dead_code.append(DeadCodeInfo(
+                            dead_type=f'after_{terminator_name}',
+                            start_line=start_line,
+                            end_line=end_line,
+                            scope_name=scope_name,
+                            description=f'Unreachable code after {terminator_name}',
+                            is_safe_to_remove=True,
+                            code_preview=code_preview,
+                            node=first_dead,
+                        ))
+                        
+                        self.findings.append(Finding(
+                            pattern_name=f'dead_code_after_{terminator_name}',
+                            severity='GREEN',  # safe to auto-fix
+                            line_num=start_line,
+                            message=f'Unreachable code after {terminator_name} statement (lines {start_line}-{end_line})',
+                            details={
+                                'dead_type': f'after_{terminator_name}',
+                                'start_line': start_line,
+                                'end_line': end_line,
+                                'scope_name': scope_name,
+                                'is_safe_to_remove': True,
+                                'dead_stmt_count': len(real_dead),
+                            },
+                            source_line=self._get_source_line(start_line),
+                        ))
+                
+                # recurse into nested structures
+                if isinstance(stmt, (Function, LocalFunction, Method)):
+                    if hasattr(stmt, 'body') and stmt.body:
+                        body = stmt.body.body if isinstance(stmt.body, Block) else [stmt.body]
+                        func_name = self._get_func_name(stmt)
+                        check_block(body, func_name, False)
+                
+                elif isinstance(stmt, If):
+                    if hasattr(stmt, 'body') and stmt.body:
+                        body = stmt.body.body if isinstance(stmt.body, Block) else [stmt.body]
+                        check_block(body, scope_name, in_loop)
+                    if hasattr(stmt, 'orelse') and stmt.orelse:
+                        if isinstance(stmt.orelse, Block):
+                            check_block(stmt.orelse.body, scope_name, in_loop)
+                        elif isinstance(stmt.orelse, (If, ElseIf)):
+                            check_block([stmt.orelse], scope_name, in_loop)
+                
+                elif isinstance(stmt, ElseIf):
+                    if hasattr(stmt, 'body') and stmt.body:
+                        body = stmt.body.body if isinstance(stmt.body, Block) else [stmt.body]
+                        check_block(body, scope_name, in_loop)
+                    if hasattr(stmt, 'orelse') and stmt.orelse:
+                        if isinstance(stmt.orelse, Block):
+                            check_block(stmt.orelse.body, scope_name, in_loop)
+                        elif isinstance(stmt.orelse, (If, ElseIf)):
+                            check_block([stmt.orelse], scope_name, in_loop)
+                
+                elif isinstance(stmt, (While, Repeat)):
+                    if hasattr(stmt, 'body') and stmt.body:
+                        body = stmt.body.body if isinstance(stmt.body, Block) else [stmt.body]
+                        check_block(body, scope_name, True)  # now in a loop
+                
+                elif isinstance(stmt, (Fornum, Forin)):
+                    if hasattr(stmt, 'body') and stmt.body:
+                        body = stmt.body.body if isinstance(stmt.body, Block) else [stmt.body]
+                        check_block(body, scope_name, True)  # now in a loop
+        
+        # start from the root
+        if hasattr(self._ast_tree, 'body') and self._ast_tree.body:
+            body = self._ast_tree.body.body if isinstance(self._ast_tree.body, Block) else [self._ast_tree.body]
+            check_block(body, '<global>', False)
+
+    def _get_func_name(self, node: Node) -> str:
+        """Get function name from function node."""
+        if isinstance(node, Function):
+            return self._node_to_string(node.name) if node.name else '<anon>'
+        elif isinstance(node, LocalFunction):
+            return node.name.id if isinstance(node.name, Name) else '<anon>'
+        elif isinstance(node, Method):
+            source = self._node_to_string(node.source)
+            method = node.name.id if isinstance(node.name, Name) else ""
+            return f"{source}:{method}"
+        return '<unknown>'
+
+    def _detect_if_false_blocks(self):
+        """Detect 'if false then ... end' blocks."""
+        self._walk_for_false_conditions(If, 'if_false')
+
+    def _detect_while_false_loops(self):
+        """Detect 'while false do ... end' loops."""
+        self._walk_for_false_conditions(While, 'while_false')
+
+    def _walk_for_false_conditions(self, node_type, dead_type: str):
+        """Walk AST to find if/while with literal false conditions."""
+        
+        def is_literal_false(node: Node) -> bool:
+            """Check if node is literal false or nil."""
+            return isinstance(node, (FalseExpr, Nil))
+        
+        # single flat walk - O(n) instead of O(n²)
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, node_type):
+                if hasattr(node, 'test') and is_literal_false(node.test):
+                    start_line = self._get_line(node)
+                    end_line = self._get_end_line(node) or start_line
+                    
+                    # get code preview
+                    preview_lines = []
+                    for ln in range(start_line, min(start_line + 3, end_line + 1)):
+                        if 0 < ln <= len(self.source_lines):
+                            preview_lines.append(self.source_lines[ln - 1].rstrip())
+                    code_preview = '\n'.join(preview_lines)
+                    if end_line > start_line + 2:
+                        code_preview += '\n...'
+                    
+                    type_name = 'if' if node_type == If else 'while'
+                    
+                    self.dead_code.append(DeadCodeInfo(
+                        dead_type=dead_type,
+                        start_line=start_line,
+                        end_line=end_line,
+                        scope_name='<unknown>',
+                        description=f'{type_name} false block (never executes)',
+                        is_safe_to_remove=True,
+                        code_preview=code_preview,
+                        node=node,
+                    ))
+                    
+                    self.findings.append(Finding(
+                        pattern_name=f'dead_code_{dead_type}',
+                        severity='GREEN',  # safe to auto-fix
+                        line_num=start_line,
+                        message=f'Dead code: {type_name} false (lines {start_line}-{end_line})',
+                        details={
+                            'dead_type': dead_type,
+                            'start_line': start_line,
+                            'end_line': end_line,
+                            'scope_name': '<unknown>',
+                            'is_safe_to_remove': True,
+                        },
+                        source_line=self._get_source_line(start_line),
+                    ))
+
+    def _detect_unused_local_vars(self):
+        """Detect local variables that are assigned but never read (Phase 2 - warning only)."""
+        
+        local_vars: Dict[str, LocalVarInfo] = {}
+        assignment_targets: Set[int] = set()  # ids of Name nodes that are assignment targets
+        
+        # First pass: collect all local variable assignments - O(n)
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, LocalAssign):
+                line = self._get_line(node)
+                for target in node.targets:
+                    if isinstance(target, Name):
+                        assignment_targets.add(id(target))
+                        var_name = target.id
+                        # don't track if it starts with _ (intentionally unused)
+                        if not var_name.startswith('_'):
+                            local_vars[var_name] = LocalVarInfo(
+                                name=var_name,
+                                assign_line=line,
+                                scope=self.current_scope,
+                                is_read=False,
+                                is_function=False,
+                            )
+            
+            elif isinstance(node, LocalFunction):
+                line = self._get_line(node)
+                if isinstance(node.name, Name):
+                    assignment_targets.add(id(node.name))
+                    func_name = node.name.id
+                    if not func_name.startswith('_'):
+                        local_vars[func_name] = LocalVarInfo(
+                            name=func_name,
+                            assign_line=line,
+                            scope=self.current_scope,
+                            is_read=False,
+                            is_function=True,
+                        )
+            
+            # Also track for loop variables as assigned
+            elif isinstance(node, Fornum):
+                if isinstance(node.target, Name):
+                    assignment_targets.add(id(node.target))
+                    var_name = node.target.id
+                    if not var_name.startswith('_'):
+                        local_vars[var_name] = LocalVarInfo(
+                            name=var_name,
+                            assign_line=self._get_line(node),
+                            scope=self.current_scope,
+                            is_read=False,
+                            is_function=False,
+                            is_loop_var=True,
+                        )
+            
+            elif isinstance(node, Forin):
+                if hasattr(node, 'targets'):
+                    for target in node.targets:
+                        if isinstance(target, Name):
+                            assignment_targets.add(id(target))
+                            var_name = target.id
+                            if not var_name.startswith('_'):
+                                local_vars[var_name] = LocalVarInfo(
+                                    name=var_name,
+                                    assign_line=self._get_line(node),
+                                    scope=self.current_scope,
+                                    is_read=False,
+                                    is_function=False,
+                                    is_loop_var=True,
+                                )
+        
+        # Second pass: find all reads - O(n)
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, Name):
+                # only count as read if NOT an assignment target
+                if id(node) not in assignment_targets:
+                    var_name = node.id
+                    if var_name in local_vars:
+                        local_vars[var_name].is_read = True
+            
+            # Check RegisterScriptCallback for callback registration
+            elif isinstance(node, Call):
+                func_name = self._node_to_string(node.func)
+                if func_name == 'RegisterScriptCallback' and len(node.args) >= 2:
+                    callback_func = self._node_to_string(node.args[1])
+                    if callback_func:
+                        self.callback_registrations.add(callback_func)
+        
+        # report unused locals
+        for name, info in local_vars.items():
+            if not info.is_read and not info.is_function and not info.is_loop_var:
+                # check if it's used as callback (RegisterScriptCallback)
+                if name in self.callback_registrations:
+                    continue
+                
+                self.findings.append(Finding(
+                    pattern_name='unused_local_variable',
+                    severity='YELLOW',  # warning only, don't auto-fix
+                    line_num=info.assign_line,
+                    message=f"Local variable '{name}' is assigned but never used",
+                    details={
+                        'var_name': name,
+                        'assign_line': info.assign_line,
+                        'is_safe_to_remove': False,  # not safe - might be intentional
+                    },
+                    source_line=self._get_source_line(info.assign_line),
+                ))
+
+    def _detect_unused_local_funcs(self):
+        """Detect local functions that are never called (Phase 2 - warning only)."""
+        # Track local function definitions and calls
+        local_funcs: Dict[str, LocalVarInfo] = {}
+        called_funcs: Set[str] = set()
+        
+        # Single pass through AST - O(n)
+        for node in ast.walk(self._ast_tree):
+            if isinstance(node, LocalFunction):
+                line = self._get_line(node)
+                if isinstance(node.name, Name):
+                    func_name = node.name.id
+                    if not func_name.startswith('_'):
+                        local_funcs[func_name] = LocalVarInfo(
+                            name=func_name,
+                            assign_line=line,
+                            scope=self.current_scope,
+                            is_read=False,
+                            is_function=True,
+                        )
+            
+            elif isinstance(node, Call):
+                func_name = self._node_to_string(node.func)
+                if func_name:
+                    called_funcs.add(func_name)
+                
+                # check for RegisterScriptCallback
+                if func_name == 'RegisterScriptCallback' and len(node.args) >= 2:
+                    callback_func = self._node_to_string(node.args[1])
+                    if callback_func:
+                        self.callback_registrations.add(callback_func)
+                        called_funcs.add(callback_func)
+            
+            elif isinstance(node, Name):
+                # function reference (not call)
+                called_funcs.add(node.id)
+        
+        # report unused local functions
+        for name, info in local_funcs.items():
+            if name not in called_funcs and name not in self.callback_registrations:
+                # check if it's a known callback name
+                if name in HOT_CALLBACKS or name in SAFE_CALLBACK_PARAMS:
+                    continue
+                
+                self.findings.append(Finding(
+                    pattern_name='unused_local_function',
+                    severity='YELLOW',  # warning only
+                    line_num=info.assign_line,
+                    message=f"Local function '{name}' appears to be unused",
+                    details={
+                        'func_name': name,
+                        'assign_line': info.assign_line,
+                        'is_safe_to_remove': False,  # not safe - might be callback
+                    },
+                    source_line=self._get_source_line(info.assign_line),
+                ))
 
     def _get_source_line(self, line_num: int) -> str:
         """Get source line by number."""
