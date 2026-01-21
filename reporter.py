@@ -1,8 +1,10 @@
 """
-This generates HTML analysis reports using Jinja2 templating.
+Report generator for FLAO (FiveM Lua Auto Optimizer).
+Generates HTML/TXT/JSON analysis reports using Jinja2 templating.
 Templates are inside "templates" folder.
 
-bruh wish we had Twig :3
+Originally based on ALAO by Abraham (Priler).
+Refactored for FiveM/GTA 5 Lua optimization.
 """
 
 import html
@@ -27,6 +29,7 @@ PERFORMANCE_IMPACT = {
     # CRITICAL - can destroy frame time
     'expensive_in_hotpath': 'critical',
     'string_concat_in_loop': 'critical',
+    'distance_native': 'high',  # GetDistanceBetweenCoords should use vector math
 
     # HIGH - moderate to high impact in tight loops
     'table_insert_append': 'high',
@@ -125,7 +128,7 @@ class Reporter:
     """Collects findings and generates reports."""
 
     def __init__(self):
-        # mod_name -> file_path -> list of findings
+        # script_name -> file_path -> list of findings
         self.findings: Dict[str, Dict[str, List[Finding]]] = defaultdict(lambda: defaultdict(list))
         self.start_time = datetime.now()
 
@@ -140,9 +143,9 @@ class Reporter:
                 )
                 self._jinja_env.filters['basename'] = lambda p: Path(p).name
 
-    def add_finding(self, mod_name: str, file_path: Path, finding: Finding):
+    def add_finding(self, script_name: str, file_path: Path, finding: Finding):
         """Add a finding to the report."""
-        self.findings[mod_name][str(file_path)].append(finding)
+        self.findings[script_name][str(file_path)].append(finding)
 
     @property
     def all_findings(self) -> List[Finding]:
@@ -187,11 +190,11 @@ class Reporter:
             result.append((pattern, count, severity, impact))
         return result
 
-    def get_mod_severity_breakdown(self, mod_name: str) -> dict:
-        """Get severity breakdown for a specific mod."""
+    def get_mod_severity_breakdown(self, script_name: str) -> dict:
+        """Get severity breakdown for a specific script."""
         counts = {'GREEN': 0, 'YELLOW': 0, 'RED': 0, 'DEBUG': 0}
-        if mod_name in self.findings:
-            for file_findings in self.findings[mod_name].values():
+        if script_name in self.findings:
+            for file_findings in self.findings[script_name].values():
                 for f in file_findings:
                     if f.severity in counts:
                         counts[f.severity] += 1
@@ -234,7 +237,7 @@ class Reporter:
         }
 
         if mod_counts:
-            print("\nMods with most issues:")
+            print("\nScripts with most issues:")
             for mod, count in sorted(mod_counts.items(), key=lambda x: -x[1])[:10]:
                 print(f"  [{count:4d}] {mod}")
 
@@ -244,9 +247,9 @@ class Reporter:
         print("DETAILED FINDINGS")
         print("=" * 60)
 
-        for mod_name, files in sorted(self.findings.items()):
+        for script_name, files in sorted(self.findings.items()):
             print(f"\n{'-' * 60}")
-            print(f"MOD: {mod_name}")
+            print(f"Script: {script_name}")
             print(f"{'-' * 60}")
 
             for file_path, findings in sorted(files.items()):
@@ -377,7 +380,7 @@ class Reporter:
         for idx, (mod, files) in enumerate(self.findings.items()):
             if verbose and total_mods > 10:
                 progress = (idx + 1) / total_mods * 100
-                print(f"\r  Processing mods: {progress:.0f}%  ", end="", flush=True)
+                print(f"\r  Processing scripts: {progress:.0f}%  ", end="", flush=True)
 
             data['findings'][mod] = {}
             for file_path, findings in files.items():
@@ -406,7 +409,7 @@ class Reporter:
             print("  Generating text report...", end="", flush=True)
 
         lines = []
-        lines.append("Anomaly Lua Script Analysis Report")
+        lines.append("FiveM Lua Script Analysis Report (FLAO)")
         lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         lines.append("=" * 60)
         lines.append("")
@@ -424,13 +427,13 @@ class Reporter:
         lines.append("=" * 60)
 
         total_mods = len(self.findings)
-        for idx, (mod_name, files) in enumerate(sorted(self.findings.items())):
+        for idx, (script_name, files) in enumerate(sorted(self.findings.items())):
             if verbose and total_mods > 10:
                 progress = (idx + 1) / total_mods * 100
                 print(f"\r  Processing mods: {progress:.0f}%  ", end="", flush=True)
 
             lines.append("")
-            lines.append(f"MOD: {mod_name}")
+            lines.append(f"Script: {script_name}")
             lines.append("-" * 40)
 
             for file_path, findings in sorted(files.items()):

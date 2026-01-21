@@ -1,0 +1,8 @@
+# FLAO Exclusion List
+# Add resource names to exclude from analysis (one per line)
+# Lines starting with # are comments
+
+# Example exclusions:
+# qb-core
+# es_extended
+# ox_lib

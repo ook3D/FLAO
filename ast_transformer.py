@@ -1,6 +1,9 @@
 """
-AST-based Lua source transformer
-This fixes Lua source code based on AST analysis findings
+AST-based Lua source transformer for FiveM/GTA 5 scripts.
+This fixes Lua source code based on AST analysis findings.
+
+Originally based on ALAO (Anomaly Lua Auto Optimizer) by Abraham (Priler).
+Refactored for FiveM/GTA 5 Lua optimization.
 """
 
 import re
@@ -114,8 +117,8 @@ class ASTTransformer:
 
         if not dry_run:
             if backup:
-                # use .alao-bak extension to distinguish from mod author backups
-                backup_path = file_path.with_suffix(file_path.suffix + '.alao-bak')
+                # use .flao-bak extension to distinguish from other backups
+                backup_path = file_path.with_suffix(file_path.suffix + '.flao-bak')
                 if not backup_path.exists():
                     shutil.copy2(file_path, backup_path)
 
@@ -799,47 +802,47 @@ class ASTTransformer:
 
         pattern = finding.pattern_name
 
-        # determine cache variable name and cache line
-        if pattern == 'repeated_db_actor':
-            cache_line = 'local actor = db.actor'
-            new_name = 'actor'
-            call_pattern = 'db.actor'
-        elif pattern == 'repeated_time_global':
-            cache_line = 'local tg = time_global()'
-            new_name = 'tg'
-            call_pattern = 'time_global()'
-        elif pattern == 'repeated_alife':
-            cache_line = 'local sim = alife()'
-            new_name = 'sim'
-            call_pattern = 'alife()'
-        elif pattern == 'repeated_system_ini':
-            cache_line = 'local ini = system_ini()'
-            new_name = 'ini'
-            call_pattern = 'system_ini()'
-        elif pattern == 'repeated_device':
-            cache_line = 'local dev = device()'
-            new_name = 'dev'
-            call_pattern = 'device()'
-        elif pattern == 'repeated_get_console':
-            cache_line = 'local console = get_console()'
-            new_name = 'console'
-            call_pattern = 'get_console()'
-        elif pattern == 'repeated_get_hud':
-            cache_line = 'local hud = get_hud()'
-            new_name = 'hud'
-            call_pattern = 'get_hud()'
-        elif pattern == 'repeated_game_ini':
-            cache_line = 'local g_ini = game_ini()'
-            new_name = 'g_ini'
-            call_pattern = 'game_ini()'
-        elif pattern == 'repeated_getFS':
-            cache_line = 'local fs = getFS()'
-            new_name = 'fs'
-            call_pattern = 'getFS()'
-        elif pattern == 'repeated_level_name':
-            cache_line = 'local level_name = level.name()'
-            new_name = 'level_name'
-            call_pattern = 'level.name()'
+        # determine cache variable name and cache line for FiveM natives
+        if pattern == 'repeated_PlayerPedId':
+            cache_line = 'local ped = PlayerPedId()'
+            new_name = 'ped'
+            call_pattern = 'PlayerPedId()'
+        elif pattern == 'repeated_PlayerId':
+            cache_line = 'local playerId = PlayerId()'
+            new_name = 'playerId'
+            call_pattern = 'PlayerId()'
+        elif pattern == 'repeated_GetPlayerServerId':
+            cache_line = 'local serverId = GetPlayerServerId(PlayerId())'
+            new_name = 'serverId'
+            call_pattern = 'GetPlayerServerId(PlayerId())'
+        elif pattern == 'repeated_GetEntityCoords':
+            cache_line = 'local coords = GetEntityCoords(ped)'
+            new_name = 'coords'
+            call_pattern = 'GetEntityCoords'
+        elif pattern == 'repeated_GetEntityModel':
+            cache_line = 'local model = GetEntityModel(entity)'
+            new_name = 'model'
+            call_pattern = 'GetEntityModel'
+        elif pattern == 'repeated_GetHashKey':
+            cache_line = 'local hash = GetHashKey(str)'
+            new_name = 'hash'
+            call_pattern = 'GetHashKey'
+        elif pattern == 'repeated_GetPlayerPed':
+            cache_line = 'local ped = GetPlayerPed(playerId)'
+            new_name = 'ped'
+            call_pattern = 'GetPlayerPed'
+        elif pattern == 'repeated_GetVehiclePedIsIn':
+            cache_line = 'local vehicle = GetVehiclePedIsIn(ped, false)'
+            new_name = 'vehicle'
+            call_pattern = 'GetVehiclePedIsIn'
+        elif pattern == 'repeated_GetEntityHeading':
+            cache_line = 'local heading = GetEntityHeading(entity)'
+            new_name = 'heading'
+            call_pattern = 'GetEntityHeading'
+        elif pattern == 'repeated_GetDistanceBetweenCoords':
+            # This pattern should not be auto-fixed; it's a suggestion to use vector math
+            # Skip automatic caching for this one
+            return
         elif pattern.endswith('_story_id()') or pattern.endswith('_section()') or pattern.endswith('_id()') or pattern.endswith('_clsid()'):
             # dynamic method caching: repeated_obj_section(), repeated_item_id(), etc
             # extract object name and method from pattern: repeated_obj_section() -> obj, section

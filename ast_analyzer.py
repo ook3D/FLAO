@@ -1,5 +1,9 @@
 """
-AST-based Lua code analyzer implemented with https://pypi.org/project/luaparser/
+AST-based Lua code analyzer for FiveM/GTA 5 scripts.
+Implemented with https://pypi.org/project/luaparser/
+
+Originally based on ALAO (Anomaly Lua Auto Optimizer) by Abraham (Priler).
+Refactored for FiveM/GTA 5 Lua optimization.
 """
 
 from luaparser import ast
@@ -29,19 +33,17 @@ import io
 from models import Finding
 
 
-# Hot callbacks that run frequently
+# Hot callbacks/functions that run frequently in FiveM
+# Note: FiveM uses Citizen.CreateThread with while true do loops for tick handlers
+# These are common naming conventions for high-frequency handlers
 HOT_CALLBACKS = frozenset({
-    'actor_on_update', 'actor_on_first_update',
-    'npc_on_update', 'monster_on_update',
-    'on_key_press', 'on_key_release', 'on_key_hold',
-    'actor_on_weapon_fired', 'actor_on_hud_animation_end',
-    'on_before_hit', 'on_hit',
-    'physic_object_on_hit_callback',
-    'npc_on_before_hit', 'monster_on_before_hit',
-    'npc_on_hit_callback', 'monster_on_hit_callback',
-    'actor_on_feel_touch',
-    'actor_on_item_take', 'actor_on_item_drop',
-    'actor_on_item_use',
+    # Common tick handler naming patterns
+    'onTick', 'OnTick', 'tick', 'Tick',
+    'mainLoop', 'MainLoop', 'gameLoop', 'GameLoop',
+
+    # FiveM resource events (not hot per-se but important entry points)
+    'onClientResourceStart', 'onClientResourceStop',
+    'onResourceStart', 'onResourceStop',
 })
 
 # Bare globals that benefit from caching
@@ -86,43 +88,34 @@ DIRECT_REPLACEMENT_FUNCS = frozenset({
     'table.insert', 'table.getn', 'string.len',
 })
 
-# Functions/properties that can return nil - calling methods on these without
-# nil checks can cause CTD (crash to desktop)
-# Format: full_name -> description of when it returns nil
+# Functions/properties that can return nil/0/false - calling methods on these without
+# checks can cause errors or unexpected behavior
+# Format: full_name -> description of when it returns nil/0
 NIL_RETURNING_FUNCTIONS = {
-    # level functions
-    'level.object_by_id': 'object is offline or does not exist',
-    'level.get_target_obj': 'nothing under crosshair',
-    'level.get_target_element': 'nothing under crosshair',
-    
-    # alife functions
-    'alife': 'called from main menu or during loading',
-    'alife().object': 'object does not exist in simulation',
-    'alife():object': 'object does not exist in simulation',
-    
-    # game object methods that can return nil
-    ':parent': 'object has no parent (not in inventory)',
-    ':best_enemy': 'no enemy detected',
-    ':best_item': 'no item of interest found',
-    ':best_danger': 'no danger detected',
-    ':active_item': 'no weapon/item currently equipped',
-    ':active_detector': 'no detector currently active',
-    ':object': 'item not in inventory or index out of bounds',
-    ':get_enemy': 'no current enemy target',
-    ':get_corpse': 'no corpse being investigated',
-    ':get_current_outfit': 'no outfit equipped',
-    ':item_in_slot': 'slot is empty',
-    ':get_helicopter': 'not a helicopter or no helicopter',
-    ':get_car': 'not in a vehicle',
-    ':get_campfire': 'not a campfire zone',
-    ':get_artefact': 'not an artefact',
-    ':get_physics_shell': 'object has no physics shell',
-    ':spawn_ini': 'no spawn ini defined',
-    ':motivation_action_manager': 'not an NPC with action manager',
-    
-    # common patterns
-    'db.actor': 'called from main menu or during loading',
-    'db.storage': 'storage not initialized',  # db.storage[id] can be nil
+    # Player/Ped functions that can return 0 or invalid handles
+    'GetPlayerPed': 'player not loaded or invalid player ID',
+    'PlayerPedId': 'player ped not yet spawned (rare)',
+    'GetVehiclePedIsIn': 'ped is not in a vehicle (returns 0)',
+    'GetPedInVehicleSeat': 'seat is empty (returns 0)',
+    'GetClosestVehicle': 'no vehicle nearby (returns 0)',
+    'GetClosestPed': 'no ped nearby (returns 0)',
+    'GetClosestObjectOfType': 'no matching object found (returns 0)',
+
+    # Network functions
+    'NetworkGetEntityFromNetworkId': 'network ID does not exist (returns 0)',
+    'NetworkGetNetworkIdFromEntity': 'entity does not exist (returns 0)',
+
+    # Entity functions
+    'GetEntityAttachedTo': 'entity is not attached (returns 0)',
+    'GetPedSourceOfDamage': 'no damage source (returns 0)',
+    'GetPedCauseOfDeath': 'ped is alive (returns 0)',
+    'GetPedKiller': 'no killer or ped is alive (returns 0)',
+    'GetEntityPlayerIsFreeAimingAt': 'not aiming at anything (returns false, 0)',
+
+    # Vehicle functions
+    'GetPedLastVehicle': 'ped never entered a vehicle (returns 0)',
+    'GetVehicleTrailer': 'no trailer attached (returns false, 0)',
+    'GetVehiclePedIsUsing': 'ped not using vehicle (returns 0)',
 }
 
 # Method patterns that indicate the variable is being nil-checked
@@ -139,22 +132,27 @@ NIL_CHECK_PATTERNS = {
     '{var} and {var}.',
 }
 
-# Callback parameters that are guaranteed non-nil by the engine
-# Format: (callback_name, param_index) - 0-indexed
+# Callback parameters that are guaranteed non-nil by FiveM
+# Format: event_name -> set of safe param indices (0-indexed)
 SAFE_CALLBACK_PARAMS = {
-    'actor_on_item_take': {0},      # item
-    'actor_on_item_drop': {0},      # item
-    'actor_on_item_use': {0},       # item
-    'actor_on_trade': {0, 1},       # item, sell_buy  
-    'npc_on_death_callback': {0, 1}, # npc, killer
-    'monster_on_death_callback': {0, 1}, # monster, killer
-    'npc_on_hit_callback': {0},     # npc
-    'monster_on_hit_callback': {0}, # monster
-    'on_before_hit': {0, 1, 2},     # obj, shit, bone_id
-    'physic_object_on_hit_callback': {0}, # obj
-    'actor_on_before_death': {0, 1}, # who, flags
-    'save_state': {0},              # m_data
-    'load_state': {0},              # m_data
+    # FiveM Server Events
+    'playerConnecting': {0, 1, 2},      # name, setKickReason, deferrals
+    'playerDropped': {0},                # reason
+    'onResourceStart': {0},              # resourceName
+    'onResourceStop': {0},               # resourceName
+    'onResourceStarting': {0},           # resourceName
+
+    # FiveM Client Events
+    'onClientResourceStart': {0},        # resourceName
+    'onClientResourceStop': {0},         # resourceName
+    'gameEventTriggered': {0, 1},        # eventName, eventArgs
+
+    # BaseEvents (common FiveM resource)
+    'baseevents:onPlayerDied': {0, 1},           # killerType, deathCoords
+    'baseevents:onPlayerKilled': {0, 1, 2},      # killerId, deathCoords, killerType
+    'baseevents:enteredVehicle': {0, 1, 2},      # vehicle, seat, displayName
+    'baseevents:enteringVehicle': {0, 1, 2},     # vehicle, seat, displayName
+    'baseevents:leftVehicle': {0, 1, 2},         # vehicle, seat, displayName
 }
 
 
@@ -1227,6 +1225,7 @@ class ASTAnalyzer:
         self._analyze_global_writes()
         self._analyze_nil_access()
         self._analyze_dead_code()
+        self._analyze_distance_native()  # FiveM-specific
 
     def _analyze_table_insert(self):
         """Find table.insert(t, v) that can be t[#t+1] = v."""
@@ -1446,21 +1445,26 @@ class ASTAnalyzer:
 
     def _analyze_repeated_calls_in_scope(self):
         """Find repeated expensive calls within function scope."""
-        # expensive calls to track
-        # NOTE: time_global() is NOT included because it returns different values
+        # Expensive FiveM native calls to track
+        # These should be cached rather than called repeatedly in tick loops
+        # NOTE: GetGameTimer() is NOT included because it returns different values
         # each call (current time) - caching it breaks elapsed time calculations
-        # NOTE: level.object_by_id() is NOT auto-fixed because different IDs give
-        # different objects, and even same IDs can change if object is destroyed
-        expensive_calls = {'db.actor', 'alife', 'system_ini', 'game_ini', 'getFS',
-                           'device', 'get_console', 'get_hud', 'level.name'}
+        expensive_calls = {
+            'PlayerPedId',              # Get player ped - cache once per tick
+            'PlayerId',                 # Get player ID - cache once
+            'GetPlayerServerId',        # Get server ID - cache once
+            'GetEntityCoords',          # Cache coordinates if used multiple times
+            'GetEntityModel',           # Model hash doesn't change - cache it
+            'GetHashKey',               # Hash computation - cache results
+            'GetPlayerPed',             # Get ped from player ID - cache it
+            'GetVehiclePedIsIn',        # Cache vehicle reference
+            'GetEntityHeading',         # Cache heading if used multiple times
+            'GetDistanceBetweenCoords', # Should use vector math #(v1-v2) instead
+        }
 
-        # method calls that are safe to cache (immutable object properties)
-        # based on X-Ray engine source analysis:
-        # - :section() returns stored NameSection member (xr_object.h:155)
-        # - :id() returns stored Props.net_ID member (xr_object.h:98)
-        # - :clsid() returns stored m_script_clsid member (GameObject.h:257)
-        # - :story_id() returns m_story_id set once from config (xrServer_Objects_ALife.cpp:375)
-        cacheable_methods = {'section', 'id', 'clsid', 'story_id'}
+        # Method calls that are safe to cache (immutable entity properties)
+        # In FiveM/GTA5, these functions return stable values for an entity
+        cacheable_methods = set()  # FiveM uses natives, not method calls
 
         # group by function scope
         scope_calls: Dict[Scope, Dict[str, List[CallInfo]]] = defaultdict(lambda: defaultdict(list))
@@ -1487,20 +1491,27 @@ class ASTAnalyzer:
                     # suggest caching
                     severity = 'GREEN'
 
-                    if name == 'db.actor':
-                        suggestion = 'local actor = db.actor'
-                    elif name == 'alife':
-                        suggestion = 'local sim = alife()'
-                    elif name == 'system_ini':
-                        suggestion = 'local ini = system_ini()'
-                    elif name == 'device':
-                        suggestion = 'local dev = device()'
-                    elif name == 'get_console':
-                        suggestion = 'local console = get_console()'
-                    elif name == 'get_hud':
-                        suggestion = 'local hud = get_hud()'
-                    elif name == 'level.name':
-                        suggestion = 'local level_name = level.name()'
+                    if name == 'PlayerPedId':
+                        suggestion = 'local ped = PlayerPedId()'
+                    elif name == 'PlayerId':
+                        suggestion = 'local playerId = PlayerId()'
+                    elif name == 'GetPlayerServerId':
+                        suggestion = 'local serverId = GetPlayerServerId(PlayerId())'
+                    elif name == 'GetEntityCoords':
+                        suggestion = 'local coords = GetEntityCoords(ped)'
+                    elif name == 'GetEntityModel':
+                        suggestion = 'local model = GetEntityModel(entity)'
+                    elif name == 'GetHashKey':
+                        suggestion = 'local hash = GetHashKey(str) -- or use `hash` literal'
+                    elif name == 'GetPlayerPed':
+                        suggestion = 'local ped = GetPlayerPed(playerId)'
+                    elif name == 'GetVehiclePedIsIn':
+                        suggestion = 'local vehicle = GetVehiclePedIsIn(ped, false)'
+                    elif name == 'GetEntityHeading':
+                        suggestion = 'local heading = GetEntityHeading(entity)'
+                    elif name == 'GetDistanceBetweenCoords':
+                        suggestion = 'Use #(coords1 - coords2) for faster distance calculation'
+                        severity = 'YELLOW'  # More impactful optimization suggestion
                     else:
                         suggestion = f'Cache {name} result'
 
@@ -1934,10 +1945,10 @@ class ASTAnalyzer:
                     if var_name in local_vars:
                         local_vars[var_name].is_read = True
             
-            # Check RegisterScriptCallback for callback registration
+            # Check AddEventHandler for callback registration
             elif isinstance(node, Call):
                 func_name = self._node_to_string(node.func)
-                if func_name == 'RegisterScriptCallback' and len(node.args) >= 2:
+                if func_name == 'AddEventHandler' and len(node.args) >= 2:
                     callback_func = self._node_to_string(node.args[1])
                     if callback_func:
                         self.callback_registrations.add(callback_func)
@@ -1945,7 +1956,7 @@ class ASTAnalyzer:
         # report unused locals
         for name, info in local_vars.items():
             if not info.is_read and not info.is_function and not info.is_loop_var:
-                # check if it's used as callback (RegisterScriptCallback)
+                # check if it's used as callback (AddEventHandler)
                 if name in self.callback_registrations:
                     continue
                 
@@ -1988,8 +1999,8 @@ class ASTAnalyzer:
                 if func_name:
                     called_funcs.add(func_name)
                 
-                # check for RegisterScriptCallback
-                if func_name == 'RegisterScriptCallback' and len(node.args) >= 2:
+                # check for AddEventHandler
+                if func_name == 'AddEventHandler' and len(node.args) >= 2:
                     callback_func = self._node_to_string(node.args[1])
                     if callback_func:
                         self.callback_registrations.add(callback_func)
@@ -2017,6 +2028,30 @@ class ASTAnalyzer:
                         'is_safe_to_remove': False,  # not safe - might be callback
                     },
                     source_line=self._get_source_line(info.assign_line),
+                ))
+
+    def _analyze_distance_native(self):
+        """Find GetDistanceBetweenCoords calls that should use vector math instead.
+
+        FiveM optimization: #(vec1 - vec2) is significantly faster than
+        GetDistanceBetweenCoords(x1, y1, z1, x2, y2, z2, ...)
+        """
+        for call in self.calls:
+            if call.full_name == 'GetDistanceBetweenCoords':
+                # This native is expensive and should be replaced with vector math
+                self.findings.append(Finding(
+                    pattern_name='distance_native',
+                    severity='YELLOW',
+                    line_num=call.line,
+                    message='GetDistanceBetweenCoords() -> #(coords1 - coords2)',
+                    details={
+                        'suggestion': 'Use #(coords1 - coords2) for ~40% faster distance calculation',
+                        'example': 'local dist = #(GetEntityCoords(ped1) - GetEntityCoords(ped2))',
+                        'full_match': self._node_to_string(call.node),
+                        'node': call.node,
+                        'in_loop': call.in_loop,
+                    },
+                    source_line=self._get_source_line(call.line),
                 ))
 
     def _get_source_line(self, line_num: int) -> str:

@@ -1,5 +1,8 @@
 """
-As the name of this file suggests, this is a whole-program analyzer meant for cross-file dead code detection.
+Whole-program analyzer for cross-file dead code detection in FiveM resources.
+
+Originally based on ALAO (Anomaly Lua Auto Optimizer) by Abraham (Priler).
+Refactored for FiveM/GTA 5 Lua optimization.
 """
 
 from dataclasses import dataclass, field
@@ -63,49 +66,43 @@ class CrossFileAnalysis:
         return unused
 
 
-# Known callback names that the engine or scripts can call
+# Known callback/event names that FiveM can call
 KNOWN_CALLBACKS = frozenset({
-    # Engine callbacks (registered via RegisterScriptCallback)
-    'actor_on_update', 'actor_on_first_update', 'actor_on_before_death',
-    'actor_on_item_take', 'actor_on_item_drop', 'actor_on_item_use',
-    'actor_on_weapon_fired', 'actor_on_weapon_jammed', 'actor_on_weapon_reload',
-    'actor_on_hud_animation_end', 'actor_on_hud_animation_play',
-    'actor_on_feel_touch', 'actor_on_footstep',
-    'actor_on_trade', 'actor_on_info_callback',
-    'npc_on_update', 'npc_on_death_callback', 'npc_on_before_hit', 'npc_on_hit_callback',
-    'npc_on_net_spawn', 'npc_on_net_destroy',
-    'monster_on_update', 'monster_on_death_callback', 'monster_on_before_hit', 'monster_on_hit_callback',
-    'monster_on_net_spawn', 'monster_on_net_destroy',
-    'on_key_press', 'on_key_release', 'on_key_hold',
-    'on_before_hit', 'on_hit',
-    'physic_object_on_hit_callback',
-    'save_state', 'load_state',
-    'on_game_start', 'on_game_load',
-    'server_entity_on_register', 'server_entity_on_unregister',
-    'squad_on_npc_creation', 'squad_on_first_update', 'squad_on_update',
-    'smart_terrain_on_update',
-    'on_before_level_changing', 'on_level_changing',
-    
-    # Class methods that engine calls
-    'net_spawn', 'net_destroy', 'reinit', 'reload', 
-    'update', 'save', 'load', 'finalize',
-    'death_callback', 'hit_callback', 'use_callback',
-    'activate_scheme', 'deactivate_scheme', 'reset_scheme',
-    'evaluate', 'execute',
-    
-    # UI callbacks
-    'InitControls', 'InitCallBacks', 'OnMsgYes', 'OnMsgNo', 'OnMsgOk', 'OnMsgCancel',
-    'OnKeyboard', 'OnButton_clicked', 'OnListItemClicked', 'OnListItemDbClicked',
-    
-    # MCM (Mod Configuration Menu) callbacks
-    'on_mcm_load', 'on_option_change',
+    # FiveM Client Events
+    'onClientResourceStart', 'onClientResourceStop',
+    'onClientMapStart', 'onClientMapStop',
+    'onClientGameTypeStart', 'onClientGameTypeStop',
+    'gameEventTriggered', 'populationPedCreating',
+
+    # FiveM Server Events
+    'onResourceStart', 'onResourceStop', 'onResourceStarting',
+    'playerConnecting', 'playerDropped',
+
+    # BaseEvents (common FiveM resource)
+    'baseevents:onPlayerDied', 'baseevents:onPlayerKilled',
+    'baseevents:onPlayerWasted', 'baseevents:enteringVehicle',
+    'baseevents:enteredVehicle', 'baseevents:enteringAborted',
+    'baseevents:leftVehicle',
+
+    # Common thread/loop naming patterns
+    'onTick', 'OnTick', 'tick', 'Tick',
+    'mainLoop', 'MainLoop', 'gameLoop',
+
+    # NUI callbacks (often registered dynamically)
+    'RegisterNUICallback',
+
+    # Common export patterns
+    '__export', 'exports',
 })
 
-# Patterns that indicate a function is exported/public
+# Patterns that indicate a function is exported/public in FiveM
 EXPORT_PATTERNS = {
     '_G',           # _G.func = ...
     'rawset',       # rawset(_G, "name", func)
-    'module',       # module pattern
+    'exports',      # exports('name', func) - FiveM exports
+    'RegisterNetEvent',      # Event handlers
+    'RegisterServerEvent',   # Server event handlers
+    'AddEventHandler',       # Event handlers
 }
 
 
@@ -355,13 +352,13 @@ class WholeProgramAnalyzer:
                     usage_type='call',
                 ))
             
-            # Check for RegisterScriptCallback("name", func)
-            if func_name == 'RegisterScriptCallback' and len(node.args) >= 2:
-                callback_name = self._node_to_string(node.args[0])
+            # Check for AddEventHandler("eventName", func) - FiveM event registration
+            if func_name == 'AddEventHandler' and len(node.args) >= 2:
+                event_name = self._node_to_string(node.args[0])
                 callback_func = self._node_to_string(node.args[1])
-                
-                if callback_name:
-                    self.analysis.registered_callbacks.add(callback_name)
+
+                if event_name:
+                    self.analysis.registered_callbacks.add(event_name)
                 if callback_func:
                     self.analysis.registered_callbacks.add(callback_func)
                     self.analysis.usages[callback_func].append(SymbolUsage(
@@ -370,6 +367,16 @@ class WholeProgramAnalyzer:
                         line=line,
                         usage_type='callback_register',
                     ))
+
+            # Check for exports("name", func) - FiveM exports
+            if func_name == 'exports' and len(node.args) >= 2:
+                export_name = self._node_to_string(node.args[0])
+                export_func = self._node_to_string(node.args[1])
+
+                if export_name:
+                    self.analysis.exported_symbols.add(export_name)
+                if export_func:
+                    self.analysis.exported_symbols.add(export_func)
         
         # Method call: obj:method()
         elif isinstance(node, Invoke):
@@ -413,15 +420,26 @@ class WholeProgramAnalyzer:
                 ))
 
 
-def analyze_mods_directory(mods_path: Path) -> CrossFileAnalysis:
-    """Convenience function to analyze entire mods directory."""
+def analyze_resources_directory(resources_path: Path) -> CrossFileAnalysis:
+    """Convenience function to analyze entire FiveM resources directory."""
     analyzer = WholeProgramAnalyzer()
-    
-    # Find all gamedata/scripts directories
-    script_dirs = list(mods_path.glob('*/gamedata/scripts'))
-    
+
+    # Find all Lua scripts in resources with fxmanifest.lua or __resource.lua
     all_scripts = []
-    for script_dir in script_dirs:
-        all_scripts.extend(script_dir.glob('*.script'))
-    
+
+    for manifest in resources_path.rglob('fxmanifest.lua'):
+        resource_dir = manifest.parent
+        all_scripts.extend(resource_dir.rglob('*.lua'))
+
+    for manifest in resources_path.rglob('__resource.lua'):
+        resource_dir = manifest.parent
+        # Avoid duplicates
+        for lua_file in resource_dir.rglob('*.lua'):
+            if lua_file not in all_scripts:
+                all_scripts.append(lua_file)
+
     return analyzer.analyze_files(all_scripts)
+
+
+# Legacy alias for backwards compatibility
+analyze_mods_directory = analyze_resources_directory

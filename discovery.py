@@ -1,78 +1,120 @@
 """
-This finds mod folders and their Lua scripts.
+This finds FiveM resources and their Lua scripts.
 
-Handles the standard MO2 structure:
-  <path>/gamedata/scripts/*.lua
-  <path>/gamedata/scripts/*.script
+Handles the standard FiveM resource structure:
+  resources/[category]/resource_name/
+  resources/resource_name/
+
+Each resource is identified by fxmanifest.lua or __resource.lua
 """
 
 from pathlib import Path
 from typing import Dict, List
 
 
-def discover_mods(root_path: Path) -> Dict[str, List[Path]]:
+def discover_resources(root_path: Path) -> Dict[str, List[Path]]:
     """
-    Discover all mods and their script files.
+    Discover all FiveM resources and their script files.
 
-    Returns dict mapping mod name -> list of script file paths
+    Returns dict mapping resource name -> list of script file paths
     """
-    mods = {}
+    resources = {}
     root_path = Path(root_path)
 
-    # check if this IS a gamedata folder directly
-    if root_path.name == "gamedata":
-        scripts_dir = root_path / "scripts"
-        if scripts_dir.exists():
-            scripts = find_scripts(scripts_dir)
-            if scripts:
-                mods["(root)"] = scripts
-        return mods
-
-    # check if this folder contains gamedata directly (single mod)
-    direct_gamedata = root_path / "gamedata" / "scripts"
-    if direct_gamedata.exists():
-        scripts = find_scripts(direct_gamedata)
+    # Check if this IS a resource directly (has manifest)
+    if _is_fivem_resource(root_path):
+        scripts = find_fivem_scripts(root_path)
         if scripts:
-            mods[root_path.name] = scripts
+            resources[root_path.name] = scripts
+        return resources
 
-    # scan subdirectories for mod folders
-    for item in root_path.iterdir():
-        if not item.is_dir():
-            continue
-
-        # skip common non-mod folders
-        if item.name.startswith('.') or item.name in ('__pycache__', 'backup', 'backups'):
-            continue
-
-        scripts_dir = item / "gamedata" / "scripts"
-        if scripts_dir.exists():
-            scripts = find_scripts(scripts_dir)
+    # Look for resources with fxmanifest.lua
+    for manifest in root_path.rglob('fxmanifest.lua'):
+        resource_dir = manifest.parent
+        resource_name = _get_resource_name(resource_dir, root_path)
+        if resource_name not in resources:
+            scripts = find_fivem_scripts(resource_dir)
             if scripts:
-                mods[item.name] = scripts
-        else:
-            # maybe nested structure, check one level deeper
-            for subitem in item.iterdir():
-                if subitem.is_dir():
-                    nested_scripts = subitem / "gamedata" / "scripts"
-                    if nested_scripts.exists():
-                        scripts = find_scripts(nested_scripts)
-                        if scripts:
-                            mod_name = f"{item.name}/{subitem.name}"
-                            mods[mod_name] = scripts
+                resources[resource_name] = scripts
 
-    return mods
+    # Also check for __resource.lua (older format)
+    for manifest in root_path.rglob('__resource.lua'):
+        resource_dir = manifest.parent
+        resource_name = _get_resource_name(resource_dir, root_path)
+        if resource_name not in resources:
+            scripts = find_fivem_scripts(resource_dir)
+            if scripts:
+                resources[resource_name] = scripts
+
+    return resources
+
+
+def _is_fivem_resource(path: Path) -> bool:
+    """Check if a directory is a FiveM resource."""
+    return (path / 'fxmanifest.lua').exists() or (path / '__resource.lua').exists()
+
+
+def _get_resource_name(resource_dir: Path, root_path: Path) -> str:
+    """Get a unique resource name including parent category if exists."""
+    try:
+        rel = resource_dir.relative_to(root_path)
+        # If in a category folder (e.g., [qb]/qb-core), include it
+        parts = rel.parts
+        if len(parts) > 1:
+            return '/'.join(parts)
+        return resource_dir.name
+    except ValueError:
+        return resource_dir.name
+
+
+def find_fivem_scripts(resource_dir: Path) -> List[Path]:
+    """Find all Lua scripts in a FiveM resource."""
+    scripts = []
+    seen = set()
+
+    # Common FiveM script directory patterns
+    script_patterns = [
+        '*.lua',           # Root lua files
+        'client/*.lua',    # Client scripts
+        'server/*.lua',    # Server scripts
+        'shared/*.lua',    # Shared scripts
+        'config/*.lua',    # Config files
+        'locales/*.lua',   # Locale files
+        'lib/*.lua',       # Library files
+        'modules/*.lua',   # Module files
+    ]
+
+    # First check common patterns
+    for pattern in script_patterns:
+        for lua_file in resource_dir.glob(pattern):
+            if lua_file not in seen:
+                scripts.append(lua_file)
+                seen.add(lua_file)
+
+    # Then do recursive search for any remaining .lua files
+    for lua_file in resource_dir.rglob('*.lua'):
+        if lua_file not in seen:
+            # Skip node_modules and hidden directories
+            if 'node_modules' in lua_file.parts:
+                continue
+            if any(part.startswith('.') for part in lua_file.parts):
+                continue
+            scripts.append(lua_file)
+            seen.add(lua_file)
+
+    return sorted(scripts)
 
 
 def find_scripts(scripts_dir: Path) -> List[Path]:
-    """Find all Lua script files in a directory."""
+    """Find all Lua script files in a directory (legacy compatibility)."""
     scripts = []
 
-    # .lua and .script are both used
-    for ext in ("*.lua", "*.script"):
+    # .lua files
+    for ext in ("*.lua",):
         scripts.extend(scripts_dir.glob(ext))
 
-    # also check subdirectories (some mods organize scripts in folders)
-    for ext in ("**/*.lua", "**/*.script"):
+    # also check subdirectories
+    for ext in ("**/*.lua",):
         for f in scripts_dir.glob(ext):
             if f not in scripts:
                 scripts.append(f)
@@ -80,71 +122,102 @@ def find_scripts(scripts_dir: Path) -> List[Path]:
     return sorted(scripts)
 
 
-def get_mod_info(mod_path: Path) -> dict:
+def get_resource_info(resource_path: Path) -> dict:
     """
-    Try to extract mod info from common metadata files.
+    Try to extract resource info from manifest file.
     Returns dict with name, version, author if found.
     """
-    info = {"name": mod_path.name}
+    info = {"name": resource_path.name}
 
-    # check for meta.ini (MO2 style)
-    meta_ini = mod_path / "meta.ini"
-    if meta_ini.exists():
+    # Try fxmanifest.lua first
+    manifest = resource_path / "fxmanifest.lua"
+    if not manifest.exists():
+        manifest = resource_path / "__resource.lua"
+
+    if manifest.exists():
         try:
-            content = meta_ini.read_text(encoding='utf-8', errors='ignore')
+            content = manifest.read_text(encoding='utf-8', errors='ignore')
             for line in content.splitlines():
-                if line.startswith("name="):
-                    info["name"] = line.split("=", 1)[1].strip()
-                elif line.startswith("version="):
-                    info["version"] = line.split("=", 1)[1].strip()
-                elif line.startswith("author="):
-                    info["author"] = line.split("=", 1)[1].strip()
-        except (OSError, IOError):
-            pass
-
-    # check for modinfo.txt
-    modinfo = mod_path / "modinfo.txt"
-    if modinfo.exists():
-        try:
-            content = modinfo.read_text(encoding='utf-8', errors='ignore')
-            lines = content.splitlines()
-            if lines:
-                info["name"] = lines[0].strip()
+                line = line.strip()
+                # Parse common manifest fields
+                if line.startswith("name"):
+                    # name 'Resource Name' or name "Resource Name"
+                    val = _extract_string_value(line)
+                    if val:
+                        info["name"] = val
+                elif line.startswith("version"):
+                    val = _extract_string_value(line)
+                    if val:
+                        info["version"] = val
+                elif line.startswith("author"):
+                    val = _extract_string_value(line)
+                    if val:
+                        info["author"] = val
+                elif line.startswith("description"):
+                    val = _extract_string_value(line)
+                    if val:
+                        info["description"] = val
         except (OSError, IOError):
             pass
 
     return info
 
 
+def _extract_string_value(line: str) -> str:
+    """Extract a string value from a manifest line like: name 'value' or name \"value\""""
+    # Remove the key
+    for quote in ["'", '"']:
+        if quote in line:
+            start = line.index(quote) + 1
+            end = line.rindex(quote)
+            if end > start:
+                return line[start:end]
+    return ""
+
+
 def discover_direct(path: Path) -> Dict[str, List[Path]]:
     """
-    Discover scripts directly without gamedata/scripts structure.
-    
-    - If path is a .script/.lua file, return just that file
+    Discover scripts directly without resource structure.
+
+    - If path is a .lua file, return just that file
     - If path is a directory, find all scripts in it (recursively)
-    
-    Returns dict mapping mod name -> list of script file paths
+
+    Returns dict mapping resource name -> list of script file paths
     """
     path = Path(path)
-    mods = {}
-    
-    # single file
+    resources = {}
+
+    # Single file
     if path.is_file():
-        if path.suffix in ('.script', '.lua'):
-            mods["(direct)"] = [path]
-        return mods
-    
-    # directory - find all scripts
+        if path.suffix == '.lua':
+            resources["(direct)"] = [path]
+        return resources
+
+    # Directory - find all Lua scripts
     if path.is_dir():
         scripts = []
-        for ext in ("*.lua", "*.script"):
-            scripts.extend(path.glob(ext))
-        for ext in ("**/*.lua", "**/*.script"):
-            for f in path.glob(ext):
-                if f not in scripts:
-                    scripts.append(f)
-        
+        seen = set()
+
+        # Root level
+        for lua_file in path.glob("*.lua"):
+            scripts.append(lua_file)
+            seen.add(lua_file)
+
+        # Recursive
+        for lua_file in path.rglob("*.lua"):
+            if lua_file not in seen:
+                # Skip common non-script directories
+                if 'node_modules' in lua_file.parts:
+                    continue
+                if any(part.startswith('.') for part in lua_file.parts):
+                    continue
+                scripts.append(lua_file)
+
         if scripts:
-            mods["(direct)"] = sorted(scripts)
-    
-    return mods
+            resources["(direct)"] = sorted(scripts)
+
+    return resources
+
+
+# Legacy alias for backwards compatibility
+discover_mods = discover_resources

@@ -1,78 +1,72 @@
-# ALAO - Anomaly Lua Auto Optimizer
+# FLAO - FiveM Lua Auto Optimizer
 
-AST-based Lua analyzer and optimizer for Anomaly mods _(a Lua swiss-knife, in some way)_.  
-Made for **LuaJIT 2.0.4** _(Lua 5.1)_ in the first place (comes with the latest [Modded Exes](https://github.com/themrdemonized/xray-monolith)).  
-Highly experimental _(mostly proof-of-concept)_, but battle tested with huge modpacks (600+ mods).
+AST-based Lua analyzer and optimizer for FiveM/GTA 5 resources.
+Built for **Lua 5.3/5.4** (FiveM runtime) with LuaJIT compatibility.
+Experimental but battle-tested with large resource collections.
 
-## How it works?
-Lua is a programming language.  
-And as all programming languages, it has a syntax based code.  
-Thus, it can be parsed into so-called AST _(abstract syntax tree)_.
+Originally based on [ALAO](https://github.com/Anomaly-ALAO/ALAO) by Abraham (Priler).
 
-With AST we can manipulate the code however we want without the high risk of breaking things.  
-Lua VM itself parses code into AST, then compiles it to bytecode, then executes the bytecode _(obviously)_.  
-ALAO also converts the code to AST.
+## How it works
 
-After that, we search for potential poorly optimized code entities.  
-And switch them to a better alternatives _(direct opcodes, caching, 
-reduced allocations, etc)_.  
+Lua code is parsed into an AST (abstract syntax tree), which allows safe code manipulation without breaking things. FLAO analyzes the AST to find performance issues common in FiveM scripts and can automatically fix many of them.
 
-One of the examples: https://onecompiler.com/lua/449f75hkd  
-The original function has a complexity of **O(n²)**.  
-The auto-fixed _(by ALAO)_ function has a complexity of **O(n)**.  
-For huge data _(say, 100k iterations)_, it works approximately 150x faster.  
-It also prevents unnecessary memory allocations, further reducing GC pressure.
-
-Another example ALAO handles is the usage of `math.pow(v, 2)`.  
-We can replace the function call with a single MUL bytecode instruction `v*v`.   
-The same pattern applies to  `math.pow(v, 3)` and `math.pow(v, 0.5)`.
-
+Key optimizations include:
+- Caching expensive native calls like `PlayerPedId()`, `GetEntityCoords()`, etc.
+- Replacing `GetDistanceBetweenCoords()` suggestions with vector math `#(v1 - v2)`
+- Fixing O(n²) string concatenation in loops
+- Replacing deprecated Lua patterns with faster alternatives
 
 ## Quick Start
 
 ```bash
-python stalker_lua_lint.py [path_to_mods] [options]
+python fivem_lua_lint.py [path_to_resources] [options]
 
 # Basic Usage (combinable)
---fix - Fix safe (GREEN) issues automatically
---fix-yellow - Fix unsafe (YELLOW) issues automatically
---fix-debug - Comment out debug statements (log, printf, print, etc.)
---experimental - Enable experimental fixes (see below for details)
---cache-threshold - Minimum function call count to trigger caching (default: 4)
+--fix              Fix safe (GREEN) issues automatically
+--fix-yellow       Fix unsafe (YELLOW) issues automatically
+--fix-debug        Comment out debug statements (log, printf, print, etc.)
+--experimental     Enable experimental fixes (string concat in loops, branch-aware counting)
+--cache-threshold N  Minimum call count to trigger caching (default: 4)
 
---direct - Process scripts directly (searches for .script files recursively in the path or you can provide single .script path)
---exclude "alao_exclude.txt" -- Allows to exclude certain mods from reports/fixes (you can specify any other custom .txt list)
+--direct           Process scripts directly (single .lua file or folder, no resource structure)
+--exclude "exclude.txt"  Exclude certain resources from reports/fixes
 
 # Experimental features
---fix-nil - Allows to auto-fix some nil checks (that could cause CTDs in some cases)
---remove-dead-code / --debloat - Allows to remove dead code from the scripts (faster load times)
+--fix-nil          Auto-fix some nil checks (that could cause errors)
+--remove-dead-code / --debloat  Remove dead code from scripts
 
 # Reports & Restore
---report [file] - Generate comprehensive report (.txt, .html, .json)
---revert - Restore all .alao-bak backup files (undo fixes)
+--report [file]    Generate comprehensive report (.txt, .html, .json)
+--revert           Restore all .flao-bak backup files (undo fixes)
 
 # Performance
---timeout [seconds] - Timeout per file (default: 10)
---workers / -j - Parallel workers for fixes (default: CPU count)
+--timeout [seconds]  Timeout per file (default: 10)
+--workers / -j       Parallel workers for fixes (default: CPU count)
 
 # Output
---verbose / -v - Show detailed output
---quiet / -q - Only show summary
+--verbose / -v     Show detailed output
+--quiet / -q       Only show summary
 
 # Backup Management
---backup / --no-backup - Create .alao-bak files before modifying (default: True)
---list-backups - List all .alao-bak backup files
---backup-all-scripts - Backup ALL scripts to a zip archive before modifications
+--backup / --no-backup        Create .flao-bak files before modifying (default: True)
+--list-backups                List all .flao-bak backup files
+--backup-all-scripts          Backup ALL scripts to a zip archive before modifications
 
-# Danger Zone (do not use this)
---clean-backups - Remove all .alao-bak backup files
+# Danger Zone
+--clean-backups    Remove all .flao-bak backup files
 ```
-## Requires
+
+## Requirements
 
 ```
 - Python 3.8+
 - luaparser
 - jinja2
+```
+
+Install dependencies:
+```bash
+pip install luaparser jinja2
 ```
 
 ## Currently Detected Patterns
@@ -83,28 +77,80 @@ python stalker_lua_lint.py [path_to_mods] [options]
 - `string.len(s)` → `#s`
 - `math.pow(x, 2)` → `x*x`
 - `math.pow(x, 0.5)` → `math.sqrt(x)`
-- Uncached globals used 3+ times
-- Repeated `db.actor`, `alife()`, `device()`, `get_console()` calls
+- Uncached native calls used 3+ times:
+  - `PlayerPedId()`, `PlayerId()`, `GetPlayerServerId()`
+  - `GetEntityCoords()`, `GetEntityModel()`, `GetEntityHeading()`
+  - `GetHashKey()`, `GetPlayerPed()`, `GetVehiclePedIsIn()`
 
 ### YELLOW (review needed)
+- `GetDistanceBetweenCoords()` → use `#(coords1 - coords2)` vector math
 - String concatenation in loops (`s = s .. x`) - fixable with `--experimental`
+- Potential nil access on natives that can return 0/nil
+
 ### RED (info only, no auto-fix)
 - Global variable writes
 
 ### DEBUG (can be auto commented out)
 - `print()`, `printf()`, `log()` calls
 
-## Experimental: String Concat Fix
+## FiveM-Specific Optimizations
 
-The `--experimental` flag enables few additional fixes/mechanisms.  
-For example, it enables branch-aware function calls counting.  
-And an automatic transformation of string concatenation in loops:
+### Native Call Caching
+
+FiveM natives have overhead crossing the Lua/C boundary. FLAO detects repeated calls and suggests caching:
+
+**Before:**
+```lua
+Citizen.CreateThread(function()
+    while true do
+        local coords = GetEntityCoords(PlayerPedId())
+        local heading = GetEntityHeading(PlayerPedId())
+        local model = GetEntityModel(PlayerPedId())
+        Wait(0)
+    end
+end)
+```
+
+**After (with --fix):**
+```lua
+Citizen.CreateThread(function()
+    while true do
+        local ped = PlayerPedId()
+        local coords = GetEntityCoords(ped)
+        local heading = GetEntityHeading(ped)
+        local model = GetEntityModel(ped)
+        Wait(0)
+    end
+end)
+```
+
+### Distance Calculation
+
+`GetDistanceBetweenCoords` is expensive. FLAO suggests using vector math instead:
+
+**Before:**
+```lua
+local dist = GetDistanceBetweenCoords(x1, y1, z1, x2, y2, z2, true)
+```
+
+**After (manual change suggested):**
+```lua
+local dist = #(vector3(x1, y1, z1) - vector3(x2, y2, z2))
+-- Or with existing vectors:
+local dist = #(coords1 - coords2)
+```
+
+This is ~40% faster and more readable.
+
+### String Concat Fix (Experimental)
+
+The `--experimental` flag enables automatic transformation of O(n²) string concatenation:
 
 **Before:**
 ```lua
 local result = ""
 for i = 1, 10 do
-    result = result .. get_line(i)
+    result = result .. GetLine(i)
 end
 ```
 
@@ -112,61 +158,90 @@ end
 ```lua
 local _result_parts = {}
 for i = 1, 10 do
-    _result_parts[#_result_parts+1] = get_line(i)
+    _result_parts[#_result_parts+1] = GetLine(i)
 end
 local result = table.concat(_result_parts)
 ```
 
-This optimization reduces GC pressure from O(n²) to O(n) for string building.
+## Resource Discovery
 
-**Safety:** Only applied when:
-- Variable is initialized to `""` before the loop
-- Pattern is a simple `var = var .. expr`
+FLAO automatically discovers FiveM resources by looking for `fxmanifest.lua` or `__resource.lua` files:
 
-## Nil checks performance impact
-Honestly, there are little to none performance impact even for thousands of `nil` guard checks.  
-In terms of bytecode, it compiles to _(assuming it's a local variable)_:  
-`TEST` - checks if the value is truthy  
-`JMP` - conditional jump
-
-It'll take like ~2-5 CPU nanoseconds per check and zero memory usage.  
-So feel free to apply that, as it prevents most of the CTDs caused by evil `nil`.
-
-## Safety measures
-
-In order to prevent loosing original scripts, make sure to backup them before applying the fixes.  
-However, as an additional protection level this tool automatically creates `.alao-bak` files before any changes _(next to modified script files)_.  
-
-You can also use `--backup-all-scripts` flag to make the backup of all your .script files inside your mods _(keeping the folders structure, of course)_.  
-In this case there's no need to manually backup the mods folder.  
-Because ALAO only touches .script files and all of them will have a full backup now with this option.
-
-```bash
-# Make a full backup of all .script files in a given path
-# it will create a .zip archive containing all your current scripts
-# archive will be named according to current date (ex. scripts-backup-2026-01-05_09-03-23.zip)
-python stalker_lua_lint.py /path/to/mods --backup-all-scripts
-
-# Restore from backups
-python stalker_lua_lint.py /path/to/mods --revert
-
-# List all backups
-python stalker_lua_lint.py /path/to/mods --list-backups
-
-# DANGER ZONE
-# Delete backups (DO NOT USE THIS, no point removing og scripts, better keep them)
-python stalker_lua_lint.py /path/to/mods --clean-backups
-
-# Disable backups (NOT RECOMMENDED)
-python stalker_lua_lint.py /path/to/mods --fix --no-backup
+```
+resources/
+├── [qb]/
+│   ├── qb-core/
+│   │   ├── fxmanifest.lua
+│   │   ├── client/main.lua
+│   │   └── server/main.lua
+│   └── qb-inventory/
+│       └── ...
+├── standalone/
+│   └── my-resource/
+│       ├── fxmanifest.lua
+│       └── client.lua
 ```
 
-## User guide
-☢️ I've made a Google Docs guide on how to use ALAO - https://docs.google.com/document/d/1isS0Gn9MWrJZ6eSYjh2cFSC8NfPcdWqobB9RdHkAxXI/edit?usp=sharing
+Use `--direct` to process individual files or folders without resource structure.
 
-Make sure to thoroughly read it all, so you understand how it works.  
-It's kinda verbose, but I guess it's a good thing.
+## Safety Measures
 
-## Author
+FLAO creates `.flao-bak` backup files before modifying any script. On first fix run, it also creates a full zip backup automatically.
 
-Abraham (Priler)
+```bash
+# Make a full backup before modifications
+python fivem_lua_lint.py /path/to/resources --backup-all-scripts
+
+# Restore from backups
+python fivem_lua_lint.py /path/to/resources --revert
+
+# List all backups
+python fivem_lua_lint.py /path/to/resources --list-backups
+```
+
+## Performance Tips for FiveM Scripts
+
+1. **Cache `PlayerPedId()` once per tick** - It's called frequently, cache it at the start of your loop
+2. **Use vector math for distances** - `#(v1 - v2)` instead of `GetDistanceBetweenCoords()`
+3. **Avoid `Wait(0)` when possible** - Use longer intervals if you don't need every-frame updates
+4. **Cache hash keys** - `GetHashKey()` does string hashing; cache results for repeated lookups
+5. **Use `table.concat()` for string building** - Avoid `s = s .. x` in loops
+
+## Example Output
+
+```
+$ python fivem_lua_lint.py ./resources --fix --report report.html
+
+Scanning: ./resources
+Found 45 resources with 312 Lua files
+
+Analyzing with 8 workers...
+[100.0%] 312/312 | ETA: 0s
+
+============================================================
+ANALYSIS SUMMARY
+============================================================
+
+  GREEN  (auto-fixable):    847
+  YELLOW (review needed):    23
+  RED    (info only):        12
+  DEBUG  (logging):         156
+  ----------------------------
+  TOTAL:                   1038
+
+Top issues by type:
+  [G] repeated_PlayerPedId: 234
+  [G] table_insert_append: 189
+  [Y] distance_native: 23
+  [G] repeated_GetEntityCoords: 156
+```
+
+## License
+
+MIT License - See original ALAO project for attribution.
+
+## Credits
+
+- Original ALAO: Abraham (Priler)
+- FiveM adaptation: FLAO Contributors
+- Lua parser: [luaparser](https://pypi.org/project/luaparser/)
