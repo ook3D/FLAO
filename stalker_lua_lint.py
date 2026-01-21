@@ -24,12 +24,12 @@ Options:
     --backup-all-scripts [path]
                        Backup ALL scripts to a zip archive before modifications
                        (default: scripts-backup-<date>.zip)
-    --revert          Restore all .alao-bak backup files (undo ALAO fixes)
+    --revert          Restore all .flao-bak backup files (undo FLAO fixes)
     --report [file]   Generate a comprehensive report (supports .txt, .html, .json)
 
     # SAFETY (auto-backup on first fix run)
     When any --fix* flag is used and no scripts-backup-*.zip exists in the mods folder,
-    ALAO will automatically create a backup BEFORE making any changes.
+    FLAO will automatically create a backup BEFORE making any changes.
     This ensures you always have a way to restore your original scripts.
     
     --no-first-time-auto-backup
@@ -43,18 +43,18 @@ Options:
     
     # USELESS things
     --backup / --no-backup
-                       Create .alao-bak files before modifying (default: True)
+                       Create .flao-bak files before modifying (default: True)
     --verbose / -v    Show detailed output
     --quiet / -q      Only show summary
 
     # DANGER ZONE
-    --list-backups    List all .alao-bak backup files without restoring
-    --clean-backups   Remove all .alao-bak backup files
+    --list-backups    List all .flao-bak backup files without restoring
+    --clean-backups   Remove all .flao-bak backup files
     
     # DEBUG
     --extract-debug [path]
-                       Extract all modified files (.script + .alao-bak) to a zip
-                       for debugging (default: alao_debug_extract.zip)
+                       Extract all modified files (.script + .flao-bak) to a zip
+                       for debugging (default: flao_debug_extract.zip)
     --split N          Split --extract-debug into multiple zips with N mods each
 """
 
@@ -230,7 +230,7 @@ def main():
         "--backup",
         action="store_true",
         default=True,
-        help="Create .alao-bak files before modifying (default: True)"
+        help="Create .flao-bak files before modifying (default: True)"
     )
     parser.add_argument(
         "--no-backup",
@@ -288,26 +288,26 @@ def main():
     parser.add_argument(
         "--revert",
         action="store_true",
-        help="Restore all .alao-bak backup files (undo ALAO fixes)"
+        help="Restore all .flao-bak backup files (undo FLAO fixes)"
     )
     parser.add_argument(
         "--list-backups",
         action="store_true",
-        help="List all .alao-bak backup files without restoring"
+        help="List all .flao-bak backup files without restoring"
     )
     parser.add_argument(
         "--clean-backups",
         action="store_true",
-        help="Remove all .alao-bak backup files"
+        help="Remove all .flao-bak backup files"
     )
     parser.add_argument(
         "--extract-debug",
         type=str,
         nargs='?',
-        const='alao_debug_extract.zip',
+        const='flao_debug_extract.zip',
         default=None,
         metavar="PATH",
-        help="Extract all modified files (.script + .alao-bak) to a zip for debugging (default: alao_debug_extract.zip)"
+        help="Extract all modified files (.script + .flao-bak) to a zip for debugging (default: flao_debug_extract.zip)"
     )
     parser.add_argument(
         "--split",
@@ -430,12 +430,12 @@ def main():
     else:
         print(f"Found {len(mods)} mods with {total_scripts} script files\n")
 
-    # handle backup operations (only ALAO-created .alao-bak files)
+    # handle backup operations (only FLAO-created .flao-bak files)
     if args.list_backups or args.revert or args.clean_backups:
         backup_files = []
         for mod_name, scripts in mods.items():
             for script_path in scripts:
-                bak_path = script_path.with_suffix(script_path.suffix + '.alao-bak')
+                bak_path = script_path.with_suffix(script_path.suffix + '.flao-bak')
                 if bak_path.exists():
                     backup_files.append((script_path, bak_path, mod_name))
 
@@ -502,14 +502,14 @@ def main():
         files_by_mod = {}
         for mod_name, scripts in mods.items():
             for script_path in scripts:
-                bak_path = script_path.with_suffix(script_path.suffix + '.alao-bak')
+                bak_path = script_path.with_suffix(script_path.suffix + '.flao-bak')
                 if bak_path.exists():
                     if mod_name not in files_by_mod:
                         files_by_mod[mod_name] = []
                     files_by_mod[mod_name].append((script_path, bak_path))
 
         if not files_by_mod:
-            print("No modified files found (no .alao-bak backups exist).")
+            print("No modified files found (no .flao-bak backups exist).")
             sys.exit(0)
 
         total_files = sum(len(files) for files in files_by_mod.values())
@@ -787,11 +787,11 @@ def main():
             fix_types.append("DEAD-CODE")
         print(f"{fix_msg} ({', '.join(fix_types)}) with {num_workers} workers...")
 
-        # prepare work items, skip files that already have .alao-bak (prevent double-fix)
+        # prepare work items, skip files that already have .flao-bak (prevent double-fix)
         work_items = []
         skipped_has_backup = 0
         for mod_name, script_path in all_files:
-            bak_path = script_path.with_suffix(script_path.suffix + '.alao-bak')
+            bak_path = script_path.with_suffix(script_path.suffix + '.flao-bak')
             if bak_path.exists():
                 skipped_has_backup += 1
                 if args.verbose:
@@ -977,7 +977,7 @@ def main():
     if dead_code_fixable > 0 and not args.remove_dead_code:
         print("Tip: Run with --remove-dead-code to remove safe unreachable code")
     if (args.fix or args.fix_debug or args.fix_yellow or args.experimental or args.fix_nil or args.remove_dead_code):
-        print("Tip: Run with --revert to undo all changes using .alao-bak files")
+        print("Tip: Run with --revert to undo all changes using .flao-bak files")
 
 
 if __name__ == "__main__":
