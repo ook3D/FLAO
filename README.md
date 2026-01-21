@@ -243,5 +243,5 @@ MIT License - See original ALAO project for attribution.
 ## Credits
 
 - Original ALAO: Abraham (Priler)
-- FiveM adaptation: FLAO Contributors
+- FiveM adaptation: ook3d
 - Lua parser: [luaparser](https://pypi.org/project/luaparser/)
