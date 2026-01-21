@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{% block title %}ALAO Analysis Report{% endblock %}</title>
+    <title>{% block title %}FLAO Analysis Report{% endblock %}</title>
     <style>
         {% block styles %}
         
@@ -390,7 +390,7 @@
             gap: 12px;
         }
 
-        .alao-logo {
+        .flao-logo {
             background: #238636;
             color: white;
             padding: 8px 18px;
@@ -864,16 +864,14 @@
         
         <aside class="sidebar" id="sidebar">
 
-            <img src="https://images.gog-statics.com/fdb7d76818c9b4df983d3b79e07b4f577f9cb0416149ef9d1d203fd2dbd34aac.jpg" style="width: 100%;">
-
             <div class="search-box">
-                <input type="text" class="search-input" id="searchInput" placeholder="Search mods or scripts..." oninput="filterBySearch()">
+                <input type="text" class="search-input" id="searchInput" placeholder="Search resources or scripts..." oninput="filterBySearch()">
             </div>
             
             <div class="sort-section">
-                <h3>Sort Mods</h3>
+                <h3>Sort Resources</h3>
                 <div class="sort-controls">
-                    <select class="sort-select" id="sortSelect" onchange="sortMods()">
+                    <select class="sort-select" id="sortSelect" onchange="sortResources()">
                         <option value="alpha">Alphabetically</option>
                         <option value="issues">Total Issues</option>
                         <option value="impact">Performance Impact</option>
@@ -902,8 +900,8 @@
                     <span class="stat-value" id="visibleCount">{{ summary.total }}</span>
                 </div>
                 <div class="stat-row">
-                    <span class="stat-label">Mods shown</span>
-                    <span class="stat-value" id="visibleMods">{{ findings|length }}</span>
+                    <span class="stat-label">Resources shown</span>
+                    <span class="stat-value" id="visibleResources">{{ findings|length }}</span>
                 </div>
             </div>
             
@@ -1109,7 +1107,7 @@
             
             // update sidebar stats
             document.getElementById('visibleCount').textContent = visibleFindings;
-            document.getElementById('visibleMods').textContent = visibleMods;
+            document.getElementById('visibleResources').textContent = visibleMods;
             
             // update summary impact stats
             updateSummaryImpactStats(visibleImpacts);
@@ -1241,13 +1239,13 @@
             currentSortDirection = dir;
             document.getElementById('sortAsc').classList.toggle('active', dir === 'asc');
             document.getElementById('sortDesc').classList.toggle('active', dir === 'desc');
-            sortMods();
+            sortResources();
             sortScripts();
         }
 
-        function getModImpactScore(mod) {
+        function getResourceImpactScore(resource) {
             // weight: critical=4, high=3, medium=2, low=1
-            const findings = mod.querySelectorAll('.finding:not(.hidden)');
+            const findings = resource.querySelectorAll('.finding:not(.hidden)');
             let score = 0;
             findings.forEach(f => {
                 const impact = f.dataset.impact || 'low';
@@ -1261,48 +1259,48 @@
             return score;
         }
 
-        function getModIssueCount(mod) {
-            return mod.querySelectorAll('.finding:not(.hidden)').length;
+        function getResourceIssueCount(resource) {
+            return resource.querySelectorAll('.finding:not(.hidden)').length;
         }
 
-        function sortMods() {
+        function sortResources() {
             const sortBy = document.getElementById('sortSelect').value;
             const container = document.querySelector('.main-content');
-            const mods = Array.from(document.querySelectorAll('.mod-card'));
-            
-            mods.sort((a, b) => {
+            const resources = Array.from(document.querySelectorAll('.mod-card'));
+
+            resources.sort((a, b) => {
                 let valA, valB;
-                
+
                 switch(sortBy) {
                     case 'alpha':
                         valA = a.querySelector('h2').textContent.toLowerCase();
                         valB = b.querySelector('h2').textContent.toLowerCase();
                         break;
                     case 'issues':
-                        valA = getModIssueCount(a);
-                        valB = getModIssueCount(b);
+                        valA = getResourceIssueCount(a);
+                        valB = getResourceIssueCount(b);
                         break;
                     case 'impact':
-                        valA = getModImpactScore(a);
-                        valB = getModImpactScore(b);
+                        valA = getResourceImpactScore(a);
+                        valB = getResourceImpactScore(b);
                         break;
                     default:
                         valA = a.querySelector('h2').textContent.toLowerCase();
                         valB = b.querySelector('h2').textContent.toLowerCase();
                 }
-                
+
                 let result;
                 if (typeof valA === 'string') {
                     result = valA.localeCompare(valB);
                 } else {
                     result = valA - valB;
                 }
-                
+
                 return currentSortDirection === 'desc' ? -result : result;
             });
-            
+
             // reorder DOM elements
-            mods.forEach(mod => container.appendChild(mod));
+            resources.forEach(resource => container.appendChild(resource));
         }
 
         function getScriptImpactScore(scriptSection) {

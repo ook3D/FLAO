@@ -5,4 +5,21 @@
 # Example exclusions:
 # qb-core
 # es_extended
-# ox_lib
+
+ox_lib
+ox_target
+oxmysql
+oxmysql_new
+pma-voice
+
+baseevents
+chat
+fivem-map-hipster
+mapmanager
+rconlog
+runcode
+screenshot-basic
+sessionmanager
+spawnmanager
+webpack
+yarn
