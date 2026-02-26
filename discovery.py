@@ -97,7 +97,7 @@ def find_fivem_scripts(resource_dir: Path) -> List[Path]:
             # Skip node_modules and hidden directories
             if 'node_modules' in lua_file.parts:
                 continue
-            if any(part.startswith('.') for part in lua_file.parts):
+            if any(part.startswith('.') and part not in ('.', '..') for part in lua_file.parts):
                 continue
             scripts.append(lua_file)
             seen.add(lua_file)
@@ -209,7 +209,7 @@ def discover_direct(path: Path) -> Dict[str, List[Path]]:
                 # Skip common non-script directories
                 if 'node_modules' in lua_file.parts:
                     continue
-                if any(part.startswith('.') for part in lua_file.parts):
+                if any(part.startswith('.') and part not in ('.', '..') for part in lua_file.parts):
                     continue
                 scripts.append(lua_file)
 
